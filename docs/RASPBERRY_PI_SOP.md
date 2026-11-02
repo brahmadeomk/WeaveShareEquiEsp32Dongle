@@ -323,12 +323,36 @@ can also get from the console `status` (section 6). Use `--host <that IP>`
 with the CLI.
 
 Then:
-1. Log in with **admin / admin**. A red banner shows the default login is in use (W3).
-2. Go to Settings → Security and set a new password (W4). Use it from now on:
+1. Open **http://192.168.4.1**. The login page appears. Log in with **admin / admin** (W3).
+
+   ![Login page](images/sop/sop-01-login.png)
+
+2. Click **Settings**. While the factory login is in use, red banners say
+   *Default web login in use*. Under **Security**, enter a new password twice
+   and click **Save Security** (W4). Use it from now on:
    ```bash
    export DONGLE_PASSWORD='your-new-password'
    ```
-3. Enter a wrong password 5 times. It's locked for 60 s (W5).
+   The same page holds:
+   - the diagnostic reply timeout (needed for D10)
+   - the site WiFi network (connection option C above)
+   - the Access Point name and password
+   - the firmware version and a Reboot button
+
+   ![Settings page with the default-login banner](images/sop/sop-02-settings.png)
+
+3. Log out and enter a wrong password 5 times. The login page shows *Too many
+   failed attempts - locked for 60 seconds* (W5).
+
+**The menu** at the top of every page:
+
+| Button | Page | SOP step |
+|---|---|---|
+| Diagnostics | Health verdict, findings with remedies, link status, bus totals, slave table, recent transactions, status log. Refreshes every 2 s | 8 |
+| Auto-scan | Find devices with unknown ID, baud rate or parity | 9 |
+| Sniffer | Listen-only decoding of another master's bus | 10 |
+| Settings | Diagnostics timeouts, site WiFi, Access Point, password, reboot | 7 |
+| Log Out | End the session (sessions also end after 30 min idle) | - |
 
 ---
 
@@ -356,6 +380,17 @@ Recommended master response timeout: 100 ms
    7        8        0     0.0%        8      0          0                      -  NO REPLY
 ```
 
+**The same finding on the web page:** open **Diagnostics** in the browser. The
+coloured bar gives the verdict: green = healthy, yellow = warnings, red =
+fault. Each finding has its cause, a numbered remedy, and a button for the
+next action (here *Open Auto-scan*, or *Reset statistics (after fixing)*).
+
+![Diagnostics page during faults D2 and D7](images/sop/sop-04-diag-fault.png)
+
+On a phone the same page stacks into one column:
+
+<img src="images/sop/sop-05-diag-phone.png" alt="Diagnostics page on a phone" width="320">
+
 ### 8.2 Healthy baseline (D1, W8)
 Start the simulator at 9600 N1 (section 4), run `dongle_cli.py reset`, then
 repeat the soak test (5.5) at 9600 N1 while `diag --watch 5` runs in another
@@ -366,6 +401,15 @@ terminal.
 - Requests equal the script's total, and OK equals the script's OK count
 - Idle level `HIGH (correct)`
 - The soak test still passes, so the diagnostics don't disturb bridging (W8)
+
+What a healthy bus looks like. Check these on the page:
+- the green *Bus healthy* bar
+- Port settings as set by the PC, and *Bus idle level HIGH (correct)*
+- zero in every error box under Bus totals
+- each slave at 100 % with its latency
+- *OK* rows under Recent transactions
+
+![Diagnostics page on a healthy bus](images/sop/sop-03-diag-healthy.png)
 
 ### 8.3 Deliberate faults
 Run `dongle_cli.py reset` before each one. Then make the fault, poll, and run
@@ -414,8 +458,14 @@ kill $SIM
 **Pass:** `ID 23   19200 8E1`. The settings tried before it may be listed
 under *Garbled replies at*.
 
-The other scan tests (S3–S9) run the same way. The web page Auto-scan has
-the same options plus a progress bar.
+The other scan tests (S3–S9) run the same way.
+
+**The same scan on the web page:** open **Auto-scan**, set the ID range, baud
+rates and formats, and click **Start scan**. When it's done, the page lists the
+devices found, the settings that gave garbled replies, and the port settings
+to use in your master:
+
+![Auto-scan page after finding ID 23 at 19200 8E1](images/sop/sop-06-autoscan.png)
 
 ---
 
@@ -450,6 +500,23 @@ Expected after a few seconds:
 - **SN7:** run `dongle_cli.py diag` and check it shows *Sniffer mode
   (listen-only)* and slave 1 with 100 % success.
 - **SN3 (logic analyser):** D4 stays LOW for the whole session.
+
+**The same on the web page:** open **Sniffer**, choose *Auto-detect* (or the
+settings), and click **Start sniffing**. The status line shows the detected
+settings. The table decodes every frame:
+- **MASTER** rows: the requests
+- **SLAVE** rows: the replies, with register addresses and values
+- yellow rows: exceptions
+- `?` rows: garbage
+
+Use the slave ID filter, **Pause view** and **Download CSV** (SN9) as needed.
+
+![Sniffer page decoding a PLC polling slaves 1-3](images/sop/sop-07-sniffer.png)
+
+While sniffing, **Diagnostics** analyses the other master's traffic (SN7). Here
+it flags the PLC reading a register that slave 3 doesn't have:
+
+![Diagnostics page while sniffing](images/sop/sop-08-diag-sniffing.png)
 
 **Copy to PC (SN8).** With copy-to-PC on (the default), the raw bus bytes also
 arrive on the dongle's port:

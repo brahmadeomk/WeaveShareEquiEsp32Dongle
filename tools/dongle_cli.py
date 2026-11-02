@@ -65,6 +65,8 @@ class Dongle:
         return self._req(path, data=fields)
 
 
+LABELS = {"FAULT": ("Likely cause", "Remedy"), "WARN": ("Likely cause", "Remedy"),
+          "INFO": ("Details", "What to do"), "OK": ("Summary", "Notes")}
 SEV_MARK = {"FAULT": "[FAULT]", "WARN": "[WARN] ", "INFO": "[INFO] ", "OK": "[OK]   "}
 
 
@@ -78,9 +80,9 @@ def print_diag(d):
     print("-" * 78)
     for f in d["health"]["findings"]:
         print("%s %s" % (SEV_MARK.get(f["sev"], f["sev"]), f["title"]))
-        print("        Likely cause: %s" % f["cause"])
+        first, label = LABELS.get(f["sev"], ("Likely cause", "Remedy"))
+        print("        %s: %s" % (first, f["cause"]))
         steps = [s for s in f["remedy"].split("\n") if s]
-        label = "Notes" if f["sev"] == "OK" else "Remedy"
         for i, s in enumerate(steps, 1):
             print("        %s %d. %s" % (label if i == 1 else " " * len(label), i, s))
         print()

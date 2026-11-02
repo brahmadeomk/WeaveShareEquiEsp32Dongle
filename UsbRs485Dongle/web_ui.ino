@@ -978,13 +978,14 @@ const char DASHBOARD_BODY[] PROGMEM = R"rawliteral(
 <script>
 const $=id=>document.getElementById(id);
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+const LBL={FAULT:['Likely cause','Remedy'],WARN:['Likely cause','Remedy'],INFO:['Details','What to do'],OK:['Summary','Notes']};
 const ACT={sniff:['Open Sniffer',"location.href='/sniff'"],scan:['Open Auto-scan',"location.href='/scan'"],reset:['Reset statistics (after fixing)','resetStats()'],settings:['Open Settings',"location.href='/settings'"]};
 function kv(label,val){return '<div class="kv">'+esc(label)+'<b>'+esc(val)+'</b></div>';}
 function ago(s){if(s<0)return '-';if(s<60)return s+' s';if(s<3600)return Math.floor(s/60)+' min';return Math.floor(s/3600)+' h';}
 function render(d){
   const h=$('health'); h.className='health h-'+d.health.level;
   h.textContent=({OK:'Bus healthy',WARN:'Warnings',FAULT:'Fault detected',IDLE:'Waiting for traffic'})[d.health.level]+'  ('+d.link.line+', '+d.link.mode+')';
-  $('findings').innerHTML=d.health.findings.map(f=>'<div class="f f-'+f.sev+'"><div class="t">['+f.sev+'] '+esc(f.title)+'</div><div class="d"><b>Likely cause:</b> '+esc(f.cause)+'</div>'+(f.remedy?'<div class="d"><b>'+(f.sev=='OK'?'Notes':'Remedy')+':</b><ol>'+f.remedy.split('\n').map(x=>'<li>'+esc(x)+'</li>').join('')+'</ol></div>':'')+(ACT[f.action]?'<button type="button" onclick="'+ACT[f.action][1]+'">'+ACT[f.action][0]+'</button>':'')+'</div>').join('');
+  $('findings').innerHTML=d.health.findings.map(f=>'<div class="f f-'+f.sev+'"><div class="t">['+f.sev+'] '+esc(f.title)+'</div><div class="d"><b>'+LBL[f.sev][0]+':</b> '+esc(f.cause)+'</div>'+(f.remedy?'<div class="d"><b>'+LBL[f.sev][1]+':</b><ol>'+f.remedy.split('\n').map(x=>'<li>'+esc(x)+'</li>').join('')+'</ol></div>':'')+(ACT[f.action]?'<button type="button" onclick="'+ACT[f.action][1]+'">'+ACT[f.action][0]+'</button>':'')+'</div>').join('');
   $('conn').textContent='Recommended master response timeout: '+d.recTimeoutMs+' ms';
   const L=d.link;
   $('link').innerHTML=kv('PC port',L.usbOpen?'Open':'Closed')+kv('Port settings',L.line+(L.mode.indexOf('Sniffer')==0?' (sniffer)':(L.fromHost?' (from PC)':' (default)')))+kv('Mode',L.mode)+kv('Bus idle level',L.idle)+kv('Last bus activity',L.lastActivityS<0?'never':ago(L.lastActivityS)+' ago')+kv('Diag reply timeout',L.diagTimeoutMs+' ms')+kv('WiFi AP',d.dev.ap+' / '+d.dev.apIp)+kv('Site WiFi',d.dev.sta)+kv('Uptime',ago(d.uptimeS))+kv('Free heap',d.heap+' B');
