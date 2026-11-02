@@ -111,19 +111,93 @@ their raw request and reply bytes in hex.
   bus is quiet).
 
 ### 3. Auto-scan
-Probes slave IDs (default 1–247) with a "read 1 register" request (FC03 or
-FC04, address selectable). It tries each selected baud rate and format, with
-the common settings first (default 9600 / 19200 / 38400 / 115200 × 8N1 / 8E1).
+Auto-scan finds devices when you don't know their slave ID, baud rate or
+parity. It asks every address the same simple question at each setting and
+sees who answers. It only reads; it never changes anything in a device.
 
-- **Found:** any valid reply counts, including an exception. Each device is
-  listed with its ID, baud rate, format and latency.
-- **Smart stop:** once a setting finds devices, the scan finishes that
-  setting's ID range and stops.
-- **Garbled replies:** settings where something answered but no valid frame was
-  decoded are reported. That's a hint that a device sits at a nearby setting.
-- **Stop your Modbus master before scanning.** While the scan owns the bus,
-  data from the PC is discarded (and counted). The PC's port settings are
-  restored afterwards.
+#### Using it
+1. **Close the Modbus master on the PC.** While the scan owns the bus, data
+   from the PC is discarded (and counted).
+2. Open **http://192.168.4.1 → Auto-scan**.
+3. Choose:
+
+   | Option | Default |
+   |---|---|
+   | Slave ID range | 1–247 |
+   | Probe | FC03 Read Holding Register (or FC04 Read Input Register), address 0 |
+   | Reply timeout per probe | 100 ms (20–2000 ms) |
+   | Baud rates | 9600, 19200, 38400, 115200 (also 57600, 4800, 2400, 1200) |
+   | Formats | 8N1, 8E1 (also 8O1, 8N2) |
+   | Smart stop | On |
+
+4. Press **Start scan**. The page shows a time estimate first, then progress
+   and results every second. **Stop** takes effect within one probe and keeps
+   the results found so far.
+
+#### What happens on the bus
+```
+for each setting (baud + format), common ones first:
+    switch the RS485 port to that setting, wait 20 ms
+    for ID = first .. last:
+        send   [ID] [03] [00 00] [00 01] [CRC]      "read 1 register"
+        wait up to the per-probe timeout for a reply
+        valid reply from that ID                    -> FOUND
+        bytes or framing errors, but no valid frame -> mark setting "garbled"
+    if smart stop is on and something was found     -> stop after this setting
+switch the port back to the PC's settings
+```
+
+- **Order of settings:** the ticked baud rates are tried in this order: 9600,
+  19200, 38400, 115200, 57600, 4800, 2400, 1200. Each one is tried with the
+  ticked formats in the order 8N1, 8E1, 8O1, 8N2. The default is 4 baud rates ×
+  2 formats = 8 settings, and the maximum is 32.
+- **One probe at a time:** before each probe the dongle waits the Modbus
+  3.5-character gap plus 2 ms. It then sends the probe with the same DE/RE
+  handling as normal traffic. It stops waiting as soon as a complete reply has
+  arrived, so a device that answers in 10 ms doesn't cost the full timeout.
+- **What counts as found:** any frame with a valid CRC from the ID that was
+  asked, **including an exception reply.** A device that answers "exception
+  02, illegal address" because it has no register 0 is still listed, as
+  *device present*. So the default probe finds most devices.
+- **Garbled hint:** sometimes bytes come back, or the UART reports framing or
+  parity errors, but no valid frame can be decoded. That setting is then listed
+  under *Garbled replies at…*. Usually a device is talking at a nearby baud
+  rate or a different parity, so tick more settings and scan again.
+- **Smart stop:** once a setting finds a device, the scan still checks all the
+  remaining IDs at that setting, so every device sharing it is found. Then it
+  stops instead of trying the other settings. Untick it if your bus mixes
+  devices with different settings.
+- **Results:** each device found is listed with its ID, baud rate, format and
+  response time. The page then shows the settings to use in your master, for
+  example *Use these port settings: 19200 8E1*. If nothing answered, it shows a
+  wiring and settings checklist.
+- **Afterwards:** the dongle switches back to the PC's port settings, and
+  normal bridging resumes.
+
+#### How long it takes
+The worst case for each setting, when nobody answers, is the number of IDs ×
+(timeout + about 15 ms):
+
+| Scan | Approximate worst case |
+|---|---|
+| 1 setting, IDs 1–247, 100 ms timeout | 28 s |
+| Default scan (8 settings), nothing found | 4 min |
+| Device at 9600 8N1, smart stop on | 28 s in total |
+| 8 settings, IDs 1–32 | 30 s |
+
+To speed it up, narrow the ID range (many sites use 1–32) or tick fewer
+settings.
+
+#### Limits
+- Only Modbus RTU with 8 data bits is scanned. Modbus ASCII and 7-bit devices
+  are not.
+- A device slower than the per-probe timeout is missed. Use 300–500 ms for
+  slow meters or devices behind a gateway.
+- Two devices with the same ID reply at the same time and collide. That ID
+  shows as garbled or is missed, and the diagnostics page flags it during
+  normal polling.
+- A device that ignores FC03 completely, without even an exception reply, needs
+  the FC04 probe.
 
 ## Web access, login and recovery (Gateway conventions)
 
