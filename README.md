@@ -32,15 +32,27 @@ RS485 handling as the Gateway firmware.
 | Item | Value |
 |---|---|
 | Fail-safe bias (at **one** point on the bus) | **330 Ω** from A (D+) to +5 V, and **330 Ω** from B (D-) to GND |
-| Termination | 120 Ω across A-B at the two physical ends of the cable only |
+| Termination, dongle end | **120 Ω fitted on the dongle board.** Nothing to add at this end |
+| Termination, sensor end | **120 Ω across A-B at the last device at the far end of the cable.** Fit a resistor or switch on the device's termination DIP switch. **Check this on every installation** |
+| Termination elsewhere | None. Devices in the middle of the cable must have termination switched off |
 | Expected idle voltage A-B (bus powered, no traffic) | **about +0.7 V** |
+
+**Check the sensor-end termination** with everything powered off, by measuring
+the resistance between A and B at the dongle. The 330 Ω bias resistors make
+the reading a little lower than the plain parallel value:
+
+| Resistance A-B (power off) | Meaning |
+|---|---|
+| About 50-65 Ω | Correct: dongle end + sensor end terminated |
+| About 100-120 Ω | **Sensor-end termination missing.** Only the dongle's 120 Ω is present |
+| Below about 45 Ω | Too many terminators: a device in the middle has its termination switched on |
 
 Measure the idle voltage with a multimeter, red lead on A and black lead on B:
 
 | Reading | Meaning |
 |---|---|
 | About +0.7 V | Correct: bias and termination as specified |
-| Between +0.2 V and about +0.5 V | Extra bias or termination somewhere: check that only one point has bias and only the two ends have 120 Ω |
+| Between +0.2 V and about +0.5 V | Check that 120 Ω is fitted only at the dongle and the sensor end (resistance check above), and that bias is fitted at one point only |
 | Below +0.2 V, or near 0 V | Bias missing or not powered. RS485 receivers can't tell idle from data below +0.2 V |
 | Negative (about -0.7 V) | A and B swapped |
 
@@ -127,14 +139,14 @@ their raw request and reply bytes in hex.
   | Finding | Likely cause | Remedy (summary) |
   |---|---|---|
   | **RS485 bus idles LOW** (FAULT) | A/B swapped, or no fail-safe bias | Swap A/B at the dongle. If it's still LOW with the bus connected, add 330 Ω bias (A to +5 V, B to GND) at one point, or enable one device's bias switch. Idle A-B should then read about **+0.7 V** |
-  | **Idle line level unstable** (WARN) | Floating bus picks up noise | Add 330 Ω bias at one point (idle A-B about +0.7 V), 120 Ω termination at both ends, shielded twisted pair |
+  | **Idle line level unstable** (WARN) | Floating bus picks up noise | Add 330 Ω bias at one point (idle A-B about +0.7 V), check the 120 Ω at the **sensor end** (the dongle end is built in), shielded twisted pair |
   | **Line held LOW / break events** (WARN) | Swapped pair, short, or a transmitter stuck on | Check polarity, measure the A-B idle voltage (about **+0.7 V** is correct; below +0.2 V is a fault, negative means swapped), disconnect devices one at a time |
   | **Slave N never answers** (FAULT) | Device off, wrong ID, wrong settings, or wiring | Power and LED, ID, baud/parity/stop, A/B and GND, port enabled as Modbus RTU slave; *Open Auto-scan* if unknown |
   | **Every reply is corrupted** (FAULT) | Baud/parity/stop-bit mismatch | Match the master to the device's settings exactly, or find them with Auto-scan; if they match, treat it as noise |
   | **A different device answers** (FAULT) | Device configured with another ID | The first reply byte in *Recent transactions* is the real ID: poll that ID or readdress the device |
   | **Slave N stopped responding** (FAULT) | Power, cable or settings changed at that device | Check supply/fuse, connector and spur, settings; power-cycle; follow the cable from the last device that still answers |
   | **Intermittent timeouts** (WARN/FAULT) | Slow device (late replies seen) or lost frames | Late replies: raise the master timeout to the recommended value. Otherwise: longer poll interval, retries, then the noise checklist |
-  | **N % corrupted replies** (WARN/FAULT) | Noise, reflections, weak signal | 120 Ω at both ends only, shield earthed at one end, common GND, away from VFD/motor cables, short stubs, lower baud on long runs |
+  | **N % corrupted replies** (WARN/FAULT) | Noise, reflections, weak signal | Check the 120 Ω at the **sensor end** (dongle end is built in) and none in the middle, shield earthed at one end, common GND, away from VFD/motor cables, short stubs, lower baud on long runs |
   | **Replies from another ID** (WARN) | Duplicate address, or a late reply overlapping | Unique IDs (check with Auto-scan), longer master timeout |
   | **Exception 01** (WARN) | Function code not supported | Switch FC03 ⇄ FC04 (or FC01/FC02, FC06/FC16) per the manual |
   | **Exception 02** (WARN) | Register not in the device map | 40001 → address 0 (remove prefix, minus 1), 1-based → minus 1, smaller blocks, master's base-0/base-1 option |

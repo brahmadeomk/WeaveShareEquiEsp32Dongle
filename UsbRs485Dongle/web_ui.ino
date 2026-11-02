@@ -440,8 +440,15 @@ const char *sevName(uint8_t s) {
   "If the settings are unknown, close the master and run Auto-scan - it reports the baud rate, format and ID that answer.\n" \
   "Press Reset statistics and poll again to confirm."
 
+// The dongle board already has its 120 ohm termination fitted, so the
+// remedies send the user to the far (sensor) end of the cable.
+#define STEPS_TERMINATION \
+  "The dongle end is already terminated (120 \u03A9 on the board). Check the SENSOR end: the last device on the far end of the cable needs 120 \u03A9 across A-B - fit a resistor or switch on its termination DIP switch.\n" \
+  "Make sure no device in the middle of the cable has termination switched on - only the dongle and the last sensor.\n" \
+  "To verify with everything powered off: resistance A-B at the dongle is about 50-65 \u03A9 with both ends terminated, about 100-120 \u03A9 if the sensor end is missing, below 45 \u03A9 if too many devices are terminated.\n"
+
 #define STEPS_NOISE \
-  "Fit a 120 \u03A9 termination resistor across A-B at the two physical ends of the cable only (not at every device).\n" \
+  STEPS_TERMINATION \
   "Use shielded twisted pair, A and B on one pair; connect the shield to earth at one end only.\n" \
   "Connect the RS485 GND/COM of all devices together (signal reference).\n" \
   "Route the cable away from VFD, motor and contactor wiring; cross power cables at 90\u00B0.\n" \
@@ -554,7 +561,7 @@ void runDiagnosis() {
   } else if (il == IDLE_UNSTABLE) {
     addFinding(SEV_WARN, "Idle line level unstable",
                "The bus floats between frames and picks up noise, so receivers can see false start bits.",
-               STEPS_BIAS "\nThen check termination: " STEPS_NOISE, ACT_RESET);
+               STEPS_BIAS "\n" STEPS_NOISE, ACT_RESET);
   }
   if (snapG.uartBreaks > 0 && il != IDLE_LOW) {
     addFinding(SEV_WARN, "Line held LOW (" + String(snapG.uartBreaks) + " break event(s))",

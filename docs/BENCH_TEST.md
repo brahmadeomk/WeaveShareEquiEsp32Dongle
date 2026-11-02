@@ -21,7 +21,7 @@ the earlier ones passed. Record the results in the table in §9.
 | 2 | USB-C data cable | PC link |
 | 3 | PC with Python 3 and `pip install pyserial pymodbus` | Master side |
 | 4 | **One** Modbus RTU slave. Either a real device (energy meter, VFD, PLC) **or** a second USB-RS485 adapter (e.g. Waveshare) running the slave simulator in §1.1 | Bus partner |
-| 5 | Twisted pair for A/B (+ GND), 120 Ω resistor | Bus wiring and termination |
+| 5 | Twisted pair for A/B (+ GND), 120 Ω resistor for the sensor end | Bus wiring and termination (the dongle end's 120 Ω is on the board) |
 | 6 | Logic analyser or 2-channel scope (optional, needed for test T6) | Turnaround timing |
 | 7 | Modbus Poll / QModMaster (optional) | GUI cross-check |
 
@@ -51,11 +51,14 @@ and restart it. Its settings must match what the master opens the DUT with. (The
 ### 1.2 Wiring
 
 ```
- PC ──USB── DUT (Gateway board)  A ───────┬──────── A   Slave / 2nd adapter
-                                 B ───────┼──────── B
-                                GND ──────┼──────── GND
-                                       120 Ω across A–B at the far end (and one at the DUT
-                                       if the bus is long; not needed for <2 m bench cable)
+                 DONGLE END                                  SENSOR (FAR) END
+ PC ──USB── DUT (Gateway board)                              Slave / last sensor
+            [120 Ω on board] A ──────── twisted pair ──────── A ┐
+                             B ──────────────────────────────── B ┴ [120 Ω: CHECK THIS]
+                           GND ──────────────────────────────── GND
+ Dongle end: 120 Ω already fitted.   Sensor end: fit 120 Ω across A–B, or switch
+                                     on the device's termination DIP switch.
+ Devices in between (if any): termination OFF.
 ```
 
 Logic analyser (T6): CH1 = **D3 (TX)**, CH2 = **D4 (DE/RE)**, CH3 = **D2 (RX)**, GND = board GND.
@@ -69,7 +72,8 @@ Logic analyser (T6): CH1 = **D3 (TX)**, CH2 = **D4 (DE/RE)**, CH3 = **D2 (RX)**,
 | P1 | Visual: transceiver, A/B screw terminals, no solder bridges near D2–D4 | OK |
 | P2 | Relay/DO loads (D11, D12, D13, A4) connected as in the field, or disconnected | Recorded |
 | P3 | Modem board (if fitted) | Either state is fine; the firmware won't pulse PWRKEY |
-| P4 | Bias resistors: **330 Ω** A to +5 V and **330 Ω** B to GND, fitted at one point on the bus only. 120 Ω termination at the two cable ends only | Fitted as specified |
+| P4 | Bias resistors: **330 Ω** A to +5 V and **330 Ω** B to GND, fitted at one point on the bus only | Fitted as specified |
+| P4b | **Sensor-end termination.** The dongle end has 120 Ω on the board. Check that the last device at the far end has 120 Ω across A-B (resistor or DIP switch) and that no device in the middle is terminated. With **everything powered off**, measure the resistance A-B at the dongle | **About 50-65 Ω.** About 100-120 Ω means the sensor-end termination is missing; below 45 Ω means too many terminators. Record: ______ Ω |
 | P5 | **After power-on, with no traffic:** measure A to B with a multimeter (red lead on A, black lead on B) | **About +0.7 V.** Below +0.2 V means bias missing; negative means A/B swapped; +0.2 to +0.5 V means extra bias or termination somewhere. Record the reading: ______ V |
 
 ---
@@ -222,7 +226,7 @@ finding clears.
 | **D8 Unsupported function** | Poll with a function code the device lacks (e.g. FC04 on a holding-register-only device) | **Function not supported (exception 01)** (WARN) |
 | **D9 Second master** | Connect a second master (e.g. another USB-RS485 adapter running Modbus Poll) to the same bus and let it poll while the dongle is idle | **Another device is talking on the bus** (WARN) |
 | **D10 Slow slave / short timeout** | Set Settings → Diagnostics reply timeout to 20 ms and poll a slave that answers in > 20 ms | Timeouts are counted, then **LATE REPLY** entries appear in *Recent transactions* and **intermittent timeouts** (WARN) recommends a longer master timeout. Set the timeout back to 1000 ms afterwards |
-| **D11 Noise / termination** (optional) | Long cable without termination, or a noise source next to the cable | **Corrupted replies** or **Noise between frames** (WARN), with the termination/shielding advice |
+| **D11 Noise / termination** (optional) | Long cable with the **sensor-end** 120 Ω removed, or a noise source next to the cable | **Corrupted replies** or **Noise between frames** (WARN), with the termination/shielding advice |
 | **D12 Non-RTU traffic** | Send ASCII text from a serial terminal at 9600 (e.g. `hello`) | **PC traffic is not Modbus RTU** (INFO) |
 | **D13 LED verdict** | During D2 (FAULT) and D7 (WARN), with no polling running | Red blink every 2 s (FAULT), yellow blink every 2 s (WARN) |
 
@@ -264,6 +268,7 @@ Stop the Modbus master software before each scan (closing the COM port is enough
 
 | Test | Result (Pass / Fail / N/A) | Notes / measured values |
 |---|---|---|
+| P4b Termination (A-B resistance, power off) | | Ω: |
 | P5 Idle A-B voltage | | V: |
 | T1 Flash | | |
 | T2 Boot | | |
@@ -310,8 +315,8 @@ Stop the Modbus master software before each scan (closing the COM port is enough
 | Garbage or text appears on the port with no traffic (T5 fails) | Core Debug Level isn't **None**. Rebuild with it set to None |
 | Every request times out, but the blue LED flashes | A/B swapped, slave ID/baud/parity mismatch, missing GND reference, or DE/RE (D4) not wired to the transceiver |
 | Fails only at low baud with "first byte missing" | Check T6b. DE must drop right after the last stop bit |
-| Fails only at high baud | Cable length or termination, or the transceiver's rated speed (MAX485 ≈ 2.5 Mbps max, some clones much lower) |
-| CRC errors that come and go under load (R1/R2) | Termination or biasing missing, ground loop, or noisy cable. Retest with a short bench cable |
+| Fails only at high baud | Cable length, or the sensor-end 120 Ω termination missing (check P4b), or the transceiver's rated speed (MAX485 ≈ 2.5 Mbps max, some clones much lower) |
+| CRC errors that come and go under load (R1/R2) | Sensor-end termination (P4b) or biasing missing, ground loop, or noisy cable. Retest with a short bench cable |
 | Idle level LOW or UNSTABLE on the page | Measure A-B at idle: it should be about +0.7 V with the 330 Ω bias. Negative means A/B swapped; near 0 V means the bias is missing or unpowered |
 | Web page doesn't open | Check you are connected to the **ModbusDongle** WiFi and browsing to `http://192.168.4.1` (not https). Mobile phones may drop a WiFi network that has no internet access: turn off mobile data or tell the phone to stay connected |
 | Forgot the web or AP password | Open the COM port at **74880** baud and send `factory-reset-auth` (W12) |
