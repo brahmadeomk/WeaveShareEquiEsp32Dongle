@@ -1,0 +1,1459 @@
+/* ======================================================================
+   WEB UI, LOGIN, SETTINGS, DIAGNOSIS ENGINE, USB CONSOLE  (webTask, Core 0)
+   ======================================================================
+   Conventions copied from the Gateway sketch so both products behave the
+   same for a field technician:
+   - always-on Access Point (DEFAULT_AP_SSID / DEFAULT_AP_PASSWORD,
+     http://192.168.4.1) + optional site WiFi (STA) with periodic retry
+   - single admin session: salted SHA-256 password hash in NVS ("auth"),
+     HttpOnly session cookie, 30 min sliding idle timeout, 5 failed logins
+     lock the login page for 60 s, red banner while admin/admin is in use
+   - every protected handler starts with requireAuth()
+   - key events go to a short Status Log shown on the dashboard
+   - credential recovery needs physical USB access: open the COM port at
+     CONSOLE_BAUD (74880) and send "factory-reset-auth"
+   Nothing in this file touches Serial1 or the bridge data path; it reads
+   statistics through snapshots taken under statsMux.
+   ====================================================================== */
+
+WebServer server(80);
+
+String webSessionToken = "";
+unsigned long webSessionLastActivity = 0;
+int webLoginFailCount = 0;
+unsigned long webLoginLockStart = 0;
+
+unsigned long lastWifiAttempt = 0;
+bool lastWifiConnected = false;
+
+int nvsWriteFailures = 0;
+
+// ===================== SHA-256 (same implementation as the Gateway) =====================
+static const uint32_t SHA256_K[64] = {
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+#define ROTR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+
+void sha256Transform(uint32_t *state, const uint8_t *data) {
+  uint32_t m[64];
+  for (int i = 0; i < 16; i++) {
+    m[i] = ((uint32_t)data[i * 4] << 24) | ((uint32_t)data[i * 4 + 1] << 16) | ((uint32_t)data[i * 4 + 2] << 8) | ((uint32_t)data[i * 4 + 3]);
+  }
+  for (int i = 16; i < 64; i++) {
+    uint32_t s0 = ROTR32(m[i - 15], 7) ^ ROTR32(m[i - 15], 18) ^ (m[i - 15] >> 3);
+    uint32_t s1 = ROTR32(m[i - 2], 17) ^ ROTR32(m[i - 2], 19) ^ (m[i - 2] >> 10);
+    m[i] = m[i - 16] + s0 + m[i - 7] + s1;
+  }
+  uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+  uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+  for (int i = 0; i < 64; i++) {
+    uint32_t S1 = ROTR32(e, 6) ^ ROTR32(e, 11) ^ ROTR32(e, 25);
+    uint32_t ch = (e & f) ^ ((~e) & g);
+    uint32_t t1 = h + S1 + ch + SHA256_K[i] + m[i];
+    uint32_t S0 = ROTR32(a, 2) ^ ROTR32(a, 13) ^ ROTR32(a, 22);
+    uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+    uint32_t t2 = S0 + maj;
+    h = g; g = f; f = e; e = d + t1;
+    d = c; c = b; b = a; a = t1 + t2;
+  }
+  state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+  state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+}
+
+String sha256Hex(const String &input) {
+  Sha256Ctx ctx;
+  ctx.state[0] = 0x6a09e667; ctx.state[1] = 0xbb67ae85; ctx.state[2] = 0x3c6ef372; ctx.state[3] = 0xa54ff53a;
+  ctx.state[4] = 0x510e527f; ctx.state[5] = 0x9b05688c; ctx.state[6] = 0x1f83d9ab; ctx.state[7] = 0x5be0cd19;
+  ctx.bitlen = 0;
+  ctx.datalen = 0;
+
+  for (unsigned int i = 0; i < input.length(); i++) {
+    ctx.data[ctx.datalen++] = (uint8_t)input[i];
+    if (ctx.datalen == 64) {
+      sha256Transform(ctx.state, ctx.data);
+      ctx.bitlen += 512;
+      ctx.datalen = 0;
+    }
+  }
+
+  uint32_t i = ctx.datalen;
+  ctx.bitlen += (uint64_t)ctx.datalen * 8;
+  ctx.data[i++] = 0x80;
+  if (i > 56) {
+    while (i < 64) ctx.data[i++] = 0x00;
+    sha256Transform(ctx.state, ctx.data);
+    i = 0;
+  }
+  while (i < 56) ctx.data[i++] = 0x00;
+  for (int j = 7; j >= 0; j--) {
+    ctx.data[i++] = (uint8_t)(ctx.bitlen >> (j * 8));
+  }
+  sha256Transform(ctx.state, ctx.data);
+
+  String out = "";
+  out.reserve(64);
+  for (int w = 0; w < 8; w++) {
+    for (int shift = 28; shift >= 0; shift -= 4) {
+      uint8_t nibble = (ctx.state[w] >> shift) & 0xF;
+      out += (char)(nibble < 10 ? ('0' + nibble) : ('a' + nibble - 10));
+    }
+  }
+  return out;
+}
+
+String makeRandomHex(int nBytes) {
+  String out = "";
+  out.reserve(nBytes * 2);
+  const char *hex = "0123456789abcdef";
+  for (int i = 0; i < nBytes; i++) {
+    uint8_t b = (uint8_t)(esp_random() & 0xFF);
+    out += hex[b >> 4];
+    out += hex[b & 0xF];
+  }
+  return out;
+}
+
+// ===================== Escape helpers =====================
+String htmlEscape(String text) {
+  text.replace("&", "&amp;");
+  text.replace("<", "&lt;");
+  text.replace(">", "&gt;");
+  text.replace("\"", "&quot;");
+  text.replace("'", "&#39;");
+  return text;
+}
+
+String jsonEscape(String text) {
+  text.replace("\\", "\\\\");
+  text.replace("\"", "\\\"");
+  text.replace("\n", "\\n");
+  text.replace("\r", "\\r");
+  return text;
+}
+
+// ===================== NVS config =====================
+void trackNvsString(const char *key, const String &value) {
+  size_t written = preferences.putString(key, value);
+  if (value.length() > 0 && written == 0) nvsWriteFailures++;
+}
+
+void trackNvsU32(const char *key, uint32_t value) {
+  if (preferences.putUInt(key, value) == 0) nvsWriteFailures++;
+}
+
+bool saveAuthConfig() {
+  nvsWriteFailures = 0;
+  preferences.begin("auth", false);
+  trackNvsString("user", authConfig.user);
+  trackNvsString("salt", authConfig.salt);
+  trackNvsString("hash", authConfig.passHash);
+  preferences.end();
+  if (nvsWriteFailures) logKeyEvent("NVS SAVE INCOMPLETE (auth): %d write(s) failed", nvsWriteFailures);
+  return nvsWriteFailures == 0;
+}
+
+void loadAuthConfig() {
+  preferences.begin("auth", true);
+  authConfig.user = preferences.getString("user", WEB_AUTH_DEFAULT_USER);
+  authConfig.salt = preferences.getString("salt", "");
+  authConfig.passHash = preferences.getString("hash", "");
+  preferences.end();
+  if (authConfig.user.length() == 0) authConfig.user = WEB_AUTH_DEFAULT_USER;
+}
+
+bool saveDeviceConfig() {
+  nvsWriteFailures = 0;
+  preferences.begin("device", false);
+  trackNvsString("apSsid", deviceConfig.apSsid);
+  trackNvsString("apPass", deviceConfig.apPassword);
+  preferences.end();
+  if (nvsWriteFailures) logKeyEvent("NVS SAVE INCOMPLETE (device): %d write(s) failed", nvsWriteFailures);
+  return nvsWriteFailures == 0;
+}
+
+void loadDeviceConfig() {
+  preferences.begin("device", true);
+  deviceConfig.apSsid = preferences.getString("apSsid", DEFAULT_AP_SSID);
+  deviceConfig.apPassword = preferences.getString("apPass", DEFAULT_AP_PASSWORD);
+  preferences.end();
+  if (deviceConfig.apSsid.length() == 0) deviceConfig.apSsid = DEFAULT_AP_SSID;
+  if (deviceConfig.apPassword.length() < AP_PASSWORD_MIN_LEN) deviceConfig.apPassword = DEFAULT_AP_PASSWORD;
+}
+
+bool saveWifiConfig() {
+  nvsWriteFailures = 0;
+  preferences.begin("wifi", false);
+  trackNvsString("ssid", wifiConfig.ssid);
+  trackNvsString("pass", wifiConfig.password);
+  preferences.end();
+  if (nvsWriteFailures) logKeyEvent("NVS SAVE INCOMPLETE (wifi): %d write(s) failed", nvsWriteFailures);
+  return nvsWriteFailures == 0;
+}
+
+void loadWifiConfig() {
+  preferences.begin("wifi", true);
+  wifiConfig.ssid = preferences.getString("ssid", "");
+  wifiConfig.password = preferences.getString("pass", "");
+  preferences.end();
+}
+
+bool saveDiagConfig() {
+  nvsWriteFailures = 0;
+  preferences.begin("diag", false);
+  trackNvsU32("rspTo", diagResponseTimeoutMs);
+  trackNvsU32("deadTh", diagDeadSlaveThreshold);
+  preferences.end();
+  if (nvsWriteFailures) logKeyEvent("NVS SAVE INCOMPLETE (diag): %d write(s) failed", nvsWriteFailures);
+  return nvsWriteFailures == 0;
+}
+
+void loadDiagConfig() {
+  preferences.begin("diag", true);
+  uint32_t to = preferences.getUInt("rspTo", DEFAULT_DIAG_RESPONSE_TIMEOUT_MS);
+  uint32_t th = preferences.getUInt("deadTh", DEFAULT_DEAD_SLAVE_THRESHOLD);
+  preferences.end();
+  diagResponseTimeoutMs = constrain(to, (uint32_t)MIN_DIAG_RESPONSE_TIMEOUT_MS, (uint32_t)MAX_DIAG_RESPONSE_TIMEOUT_MS);
+  diagDeadSlaveThreshold = (uint16_t)constrain(th, (uint32_t)1, (uint32_t)1000);
+}
+
+void loadAllConfig() {
+  loadAuthConfig();
+  loadDeviceConfig();
+  loadWifiConfig();
+  loadDiagConfig();
+}
+
+// ===================== Auth (same rules as the Gateway) =====================
+bool webAuthUsingDefaults() {
+  return authConfig.passHash.length() == 0;
+}
+
+bool checkWebCredentials(const String &user, const String &pass) {
+  if (user != authConfig.user) return false;
+  if (webAuthUsingDefaults()) return pass == WEB_AUTH_DEFAULT_PASS;
+  return sha256Hex(authConfig.salt + pass) == authConfig.passHash;
+}
+
+bool isAuthedRequest() {
+  if (webSessionToken.length() == 0) return false;
+
+  if (millis() - webSessionLastActivity > WEB_SESSION_TIMEOUT_MS) {
+    webSessionToken = "";
+    return false;
+  }
+
+  String cookie = server.header("Cookie");
+  int idx = cookie.indexOf("DGSESSION=");
+  if (idx < 0) return false;
+
+  int valStart = idx + 10;
+  int valEnd = cookie.indexOf(';', valStart);
+  String token = (valEnd < 0) ? cookie.substring(valStart) : cookie.substring(valStart, valEnd);
+  token.trim();
+
+  if (token != webSessionToken) return false;
+
+  webSessionLastActivity = millis();
+  return true;
+}
+
+// Page handlers: redirect to /login.
+bool requireAuth() {
+  if (isAuthedRequest()) return true;
+  server.sendHeader("Location", "/login");
+  server.send(302);
+  return false;
+}
+
+// JSON API handlers: 401 so the page script can redirect itself.
+bool requireAuthApi() {
+  if (isAuthedRequest()) return true;
+  server.send(401, "application/json", "{\"error\":\"login required\"}");
+  return false;
+}
+
+bool webLoginLockedOut() {
+  if (webLoginFailCount < WEB_LOGIN_MAX_FAILS) return false;
+  if (millis() - webLoginLockStart >= WEB_LOGIN_LOCKOUT_MS) {
+    webLoginFailCount = 0;
+    return false;
+  }
+  return true;
+}
+
+// ===================== WiFi =====================
+const char *wifiPassphraseOrNull() {
+  return (wifiConfig.password.length() > 0) ? wifiConfig.password.c_str() : NULL;
+}
+
+void connectSiteWiFi() {
+  if (wifiConfig.ssid.length() == 0) return;
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.begin(wifiConfig.ssid.c_str(), wifiPassphraseOrNull());
+}
+
+void handleWifiRetry() {
+  if (wifiConfig.ssid.length() == 0) return;
+
+  bool connected = (WiFi.status() == WL_CONNECTED);
+  if (connected != lastWifiConnected) {
+    lastWifiConnected = connected;
+    if (connected) logKeyEvent("WIFI CONNECTED: %s", WiFi.localIP().toString().c_str());
+    else logKeyEvent("WIFI DISCONNECTED: %s", wifiConfig.ssid.c_str());
+  }
+
+  if (connected) return;
+  if (millis() - lastWifiAttempt > WIFI_RETRY_INTERVAL_MS) {
+    lastWifiAttempt = millis();
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(wifiConfig.ssid.c_str(), wifiPassphraseOrNull());
+  }
+}
+
+String hostnameString() {
+  uint64_t efuseMac = ESP.getEfuseMac();
+  char hostname[24];
+  snprintf(hostname, sizeof(hostname), HOSTNAME_PREFIX "%02X%02X%02X",
+           (uint8_t)(efuseMac >> 24), (uint8_t)(efuseMac >> 32), (uint8_t)(efuseMac >> 40));
+  return String(hostname);
+}
+
+// ===================== Snapshot + diagnosis engine =====================
+SlaveStats snapSlaves[SLAVE_SLOTS];
+GlobalStats snapG;
+TxLogEntry snapLog[TXLOG_SIZE];
+uint8_t snapLogHead = 0;
+uint32_t snapLogTotal = 0;
+
+Finding findings[MAX_FINDINGS];
+int findingCount = 0;
+uint8_t overallSev = SEV_OK;
+uint32_t recommendedTimeoutMs = 100;
+
+void takeSnapshot() {
+  portENTER_CRITICAL(&statsMux);
+  memcpy(snapSlaves, slaveStats, sizeof(snapSlaves));
+  memcpy(&snapG, &gstats, sizeof(snapG));
+  memcpy(snapLog, txLog, sizeof(snapLog));
+  snapLogHead = txLogHead;
+  snapLogTotal = txLogTotal;
+  portEXIT_CRITICAL(&statsMux);
+}
+
+void resetStatistics() {
+  portENTER_CRITICAL(&statsMux);
+  memset(slaveStats, 0, sizeof(slaveStats));
+  memset(&gstats, 0, sizeof(gstats));
+  memset(txLog, 0, sizeof(txLog));
+  txLogHead = 0;
+  txLogTotal = 0;
+  gstats.statsSinceMs = millis();
+  portEXIT_CRITICAL(&statsMux);
+  idleLevel = IDLE_UNKNOWN;
+}
+
+void addFinding(uint8_t sev, const String &title, const String &detail) {
+  if (findingCount < MAX_FINDINGS) {
+    findings[findingCount].sev = sev;
+    findings[findingCount].title = title;
+    findings[findingCount].detail = detail;
+    findingCount++;
+  }
+  if (sev > overallSev) overallSev = sev;
+}
+
+String msText(uint32_t us) {
+  return String(us / 1000.0, 1);
+}
+
+// Master response timeout that comfortably covers the slowest reply seen:
+// 2x worst latency + 20 ms, at least 100 ms, rounded up to 50 ms.
+uint32_t recommendTimeoutMs(uint32_t worstLatUs) {
+  uint32_t ms = (2 * worstLatUs) / 1000 + 20;
+  if (ms < 100) ms = 100;
+  return ((ms + 49) / 50) * 50;
+}
+
+const char *excName(uint8_t code) {
+  switch (code) {
+    case 1: return "Illegal Function";
+    case 2: return "Illegal Data Address";
+    case 3: return "Illegal Data Value";
+    case 4: return "Slave Device Failure";
+    case 5: return "Acknowledge";
+    case 6: return "Slave Device Busy";
+    case 8: return "Memory Parity Error";
+    case 10: return "Gateway Path Unavailable";
+    case 11: return "Gateway Target No Response";
+    default: return "Exception";
+  }
+}
+
+const char *resultName(uint8_t r) {
+  switch (r) {
+    case TR_OK: return "OK";
+    case TR_EXCEPTION: return "EXCEPTION";
+    case TR_TIMEOUT: return "TIMEOUT";
+    case TR_CRC: return "CRC/LENGTH";
+    case TR_WRONG_SLAVE: return "WRONG ID";
+    case TR_BAD_FUNCTION: return "BAD FC";
+    case TR_BROADCAST: return "BROADCAST";
+    case TR_LATE: return "LATE REPLY";
+    case TR_FOREIGN: return "FOREIGN";
+    case TR_NON_RTU: return "NOT RTU";
+    default: return "?";
+  }
+}
+
+const char *sevName(uint8_t s) {
+  switch (s) {
+    case SEV_FAULT: return "FAULT";
+    case SEV_WARN: return "WARN";
+    case SEV_INFO: return "INFO";
+    default: return "OK";
+  }
+}
+
+void diagnoseExceptions(const String &sid, const SlaveStats &s) {
+  for (uint8_t code = 1; code < 16; code++) {
+    if (!(s.excMask & (1 << code))) continue;
+    switch (code) {
+      case 1:
+        addFinding(SEV_WARN, sid + ": function not supported (exception 01)",
+                   "The device rejects this function code. Many meters implement only FC03 (holding registers) or only FC04 (input registers): try the other one, or check the device manual.");
+        break;
+      case 2:
+        addFinding(SEV_WARN, sid + ": illegal data address (exception 02)",
+                   "A requested register does not exist in this device. Check the numbering: manuals often list 40001/30001-style or 1-based numbers, while the request on the wire is 0-based. Try the address minus 1 without the 4xxxx/3xxxx prefix, and make sure a block read doesn't cross a gap in the register map.");
+        break;
+      case 3:
+        addFinding(SEV_WARN, sid + ": illegal data value (exception 03)",
+                   "Quantity or value not accepted. Read at most 125 registers (2000 coils) per request, and keep written values inside the range the device allows.");
+        break;
+      case 4:
+        addFinding(SEV_FAULT, sid + ": device failure (exception 04)",
+                   "The device reported an internal error while processing the request. Check the device itself (alarms, configuration, firmware).");
+        break;
+      case 5:
+      case 6:
+        addFinding(SEV_INFO, sid + ": device busy (exception 05/06)",
+                   "The device is busy with a long operation. Poll it more slowly or retry later.");
+        break;
+      case 10:
+      case 11:
+        addFinding(SEV_WARN, sid + ": gateway error (exception 0A/0B)",
+                   "This address belongs to a Modbus gateway that cannot reach (0A) or got no answer from (0B) the downstream device behind it.");
+        break;
+      default:
+        addFinding(SEV_INFO, sid + ": exception " + String(code), String(excName(code)) + " reported by the device.");
+        break;
+    }
+  }
+}
+
+void runDiagnosis() {
+  takeSnapshot();
+  findingCount = 0;
+  overallSev = SEV_OK;
+
+  String line = lineCodingText(activeCoding);
+  bool hostOpen = (bool)Serial;
+  uint8_t mode = bridgeMode;
+  uint8_t il = idleLevel;
+
+  if (mode == MODE_SCAN) {
+    addFinding(SEV_INFO, "Auto-scan in progress", "The dongle owns the bus. Bytes from the PC are discarded until the scan ends.");
+  } else if (mode == MODE_CONSOLE) {
+    addFinding(SEV_INFO, "USB console mode", "The PC opened the port at " + String(CONSOLE_BAUD) + " baud, so nothing is bridged. Re-open the port at the bus baud rate to resume.");
+  } else if (!hostOpen) {
+    addFinding(SEV_INFO, "PC port not open", "No application has the COM port open. Open it in your Modbus master software.");
+  }
+
+  // ---- physical layer ----
+  if (il == IDLE_LOW) {
+    addFinding(SEV_FAULT, "RS485 bus idles LOW",
+               "Between frames the receiver reads a constant 0. Usual causes: A and B swapped, or no fail-safe bias on the bus. Swap A/B first; if that doesn't help, add bias resistors (about 680 &Omega; from A to +5 V and from B to GND, at one point on the bus).");
+  } else if (il == IDLE_UNSTABLE) {
+    addFinding(SEV_WARN, "Idle line level unstable",
+               "The bus floats between frames and picks up noise. Add fail-safe bias resistors (about 680 &Omega; A to +5 V, B to GND, at one point) and 120 &Omega; termination at the two ends of the cable only.");
+  }
+  if (snapG.uartBreaks > 0 && il != IDLE_LOW) {
+    addFinding(SEV_WARN, "Line held LOW (" + String(snapG.uartBreaks) + " break event(s))",
+               "The bus was held at 0 for longer than a character. Check A/B polarity, and look for a device whose transmitter stays switched on.");
+  }
+
+  uint32_t total = snapG.requests;
+  if (total == 0 && snapG.nonRtuRequests == 0 && snapG.broadcasts == 0 && mode == MODE_BRIDGE) {
+    addFinding(SEV_INFO, "No Modbus traffic yet", "Start polling from your Modbus master on this COM port (currently " + line + ").");
+  }
+
+  // ---- per slave ----
+  uint32_t worstLatUs = 0;
+  int slavesAnswering = 0;
+  uint32_t answered = 0;
+  bool garbledSeen = (snapG.uartFrameErrors + snapG.uartParityErrors) > 0;
+
+  for (int id = 1; id < SLAVE_SLOTS; id++) {
+    const SlaveStats &s = snapSlaves[id];
+    if (s.requests == 0) continue;
+
+    uint32_t replies = s.ok + s.exceptions + s.badFunction;
+    answered += s.ok + s.exceptions;
+    if (replies) slavesAnswering++;
+    if (s.latMaxUs > worstLatUs) worstLatUs = s.latMaxUs;
+    String sid = "Slave " + String(id);
+
+    if (id > 247) {
+      addFinding(SEV_WARN, sid + ": reserved address", "IDs 248-255 are reserved by the Modbus specification; most devices cannot use them.");
+    }
+
+    if (replies == 0 && s.requests >= 3) {
+      if (s.crcErrors > 0) {
+        addFinding(SEV_FAULT, sid + ": every reply is corrupted",
+                   "Bytes come back but never as a valid frame. This is almost always a baud rate / parity / stop-bit mismatch: the PC port is set to " + line + ". Check the device's communication settings, or find them with Auto-scan.");
+      } else if (s.wrongSlave > 0) {
+        addFinding(SEV_FAULT, sid + ": a different device answers",
+                   "Valid replies come back, but from another slave ID. Check the address configured in the device; two devices may share one.");
+      } else if (garbledSeen) {
+        addFinding(SEV_FAULT, sid + " never answers",
+                   "No reply to " + String(s.requests) + " request(s), and garbled bytes were seen on the bus: a device is probably talking at different settings than " + line + ". Run Auto-scan to find its baud rate and parity.");
+      } else {
+        addFinding(SEV_FAULT, sid + " never answers",
+                   "No reply to " + String(s.requests) + " request(s) at " + line + ". Check in this order: device powered, slave ID, the device's baud rate/parity, A/B wiring (swap if unsure), common GND. Auto-scan finds a device whose settings are unknown.");
+      }
+      continue;
+    }
+
+    if (replies > 0 && s.consecTimeouts >= diagDeadSlaveThreshold) {
+      uint32_t ago = (millis() - s.lastReplyMs) / 1000;
+      addFinding(SEV_FAULT, sid + " stopped responding",
+                 "It answered " + String(s.okBeforeOutage) + " request(s), but the last " + String(s.consecTimeouts) + " timed out (last good reply " + String(ago) + " s ago). Check that device's power, its cable spur and connectors.");
+    } else if (s.requests >= 20) {
+      float toPct = 100.0f * s.timeouts / s.requests;
+      if (toPct >= 2.0f) {
+        String d = String(toPct, 1) + "% of requests got no reply. ";
+        if (s.lateReplies > 0) {
+          d += String(s.lateReplies) + " reply(ies) arrived after the dongle had stopped waiting: the device is slower than expected. Set the master's response timeout to at least " + String(recommendTimeoutMs(s.latMaxUs)) + " ms.";
+        } else {
+          d += "Typical causes: noise or missing termination, the device busy with other work, or polling too fast. Try a longer poll interval and check the 120 &Omega; termination at both cable ends.";
+        }
+        addFinding(toPct >= 20.0f ? SEV_FAULT : SEV_WARN, sid + ": intermittent timeouts", d);
+      }
+    }
+
+    if (s.requests >= 20) {
+      float crcPct = 100.0f * s.crcErrors / s.requests;
+      if (crcPct >= 1.0f) {
+        addFinding(crcPct >= 10.0f ? SEV_FAULT : SEV_WARN, sid + ": " + String(crcPct, 1) + "% corrupted replies",
+                   "Electrical noise or signal reflections. Fit 120 &Omega; termination at both ends of the bus (not at every device), use shielded twisted pair with a common GND, keep the cable away from VFD/motor wiring, and keep stubs short.");
+      }
+    }
+
+    if (s.wrongSlave > 0) {
+      addFinding(SEV_WARN, sid + ": replies from another ID",
+                 String(s.wrongSlave) + " reply(ies) came from a different slave ID. Either two devices share an address, or a slow device answered an earlier request after the master had moved on. Give every device a unique ID and lengthen the master timeout.");
+    }
+    if (s.badFunction > 0) {
+      addFinding(SEV_WARN, sid + ": unexpected function code in reply",
+                 String(s.badFunction) + " reply(ies) carried a different function code than the request. Usually a device or gateway firmware issue.");
+    }
+
+    diagnoseExceptions(sid, s);
+
+    if (s.latCount >= 3 && s.latMaxUs > 200000) {
+      addFinding(SEV_INFO, sid + ": slow responder",
+                 "Replies take " + msText(s.latSumUs / s.latCount) + " ms on average, up to " + msText(s.latMaxUs) + " ms. Set the master's response timeout to at least " + String(recommendTimeoutMs(s.latMaxUs)) + " ms and keep the poll interval above that.");
+    }
+  }
+
+  // ---- bus-wide ----
+  if (snapG.foreignFrames > 0) {
+    addFinding(SEV_WARN, "Another device is talking on the bus",
+               String(snapG.foreignFrames) + " valid Modbus frame(s) appeared that were not replies to requests sent through this dongle. Only one master may poll an RS485 segment: disconnect or disable the other PLC/HMI/gateway, otherwise frames collide.");
+  }
+  if (snapG.glitchBytes > 0) {
+    addFinding(SEV_WARN, "Stray byte in front of replies",
+               String(snapG.glitchBytes) + " reply(ies) started with an extra byte (often 0x00 or 0xFF), caused by a transceiver switching without fail-safe bias. Add bias resistors; many master programs report these replies as CRC errors.");
+  }
+  if (snapG.noiseBytes >= 10 && (uint64_t)snapG.noiseBytes * 100 >= (uint64_t)max(snapG.rxBytes, (uint32_t)1) * 2) {
+    addFinding(SEV_WARN, "Noise between frames",
+               String(snapG.noiseBytes) + " received byte(s) belonged to no frame. Check termination, bias, shielding and grounding, and that no device transmits at a different baud rate.");
+  }
+  if (garbledSeen) {
+    addFinding(SEV_WARN, "UART framing/parity errors",
+               String(snapG.uartFrameErrors) + " framing and " + String(snapG.uartParityErrors) + " parity error(s) at " + line + ": a device on the bus uses different settings, or the signal is distorted. Run Auto-scan if a device never answers.");
+  }
+  if (snapG.uartOverflows + snapG.usbOverflows > 0) {
+    addFinding(SEV_WARN, "Data overflow",
+               "Data arrived faster than it could be passed on (" + String(snapG.uartOverflows) + " RS485, " + String(snapG.usbOverflows) + " USB). Close other programs using the COM port and avoid very large request bursts.");
+  }
+  if (snapG.nonRtuRequests > 0) {
+    if (total == 0) {
+      addFinding(SEV_INFO, "PC traffic is not Modbus RTU",
+                 String(snapG.nonRtuRequests) + " request(s) had no valid RTU CRC. This is probably Modbus ASCII or another protocol: data still passes through unchanged, but the diagnostics only cover Modbus RTU.");
+    } else {
+      addFinding(SEV_WARN, "Some PC requests had a bad CRC",
+                 String(snapG.nonRtuRequests) + " request(s) from the PC were not valid RTU frames. Check the master's protocol setting (RTU, not ASCII or RTU-over-TCP).");
+    }
+  }
+  if (snapG.scanDroppedBytes > 0 && mode != MODE_SCAN) {
+    addFinding(SEV_INFO, "PC data was discarded during a scan",
+               String(snapG.scanDroppedBytes) + " byte(s) from the PC arrived while Auto-scan owned the bus and were dropped. Stop the master before scanning.");
+  }
+
+  recommendedTimeoutMs = recommendTimeoutMs(worstLatUs);
+  if (overallSev <= SEV_INFO && total > 0) {
+    float pct = 100.0f * answered / total;
+    addFinding(SEV_OK, "Bus healthy",
+               String(pct, 1) + "% of " + String(total) + " request(s) answered by " + String(slavesAnswering) + " slave(s); slowest reply " + msText(worstLatUs) + " ms. Recommended master response timeout: " + String(recommendedTimeoutMs) + " ms.");
+  }
+
+  healthLevel = (overallSev >= SEV_WARN) ? overallSev : (uint8_t)SEV_OK;
+}
+
+String hexBytes(const uint8_t *p, uint16_t len, uint16_t cap) {
+  String s = "";
+  uint16_t n = min(len, cap);
+  for (uint16_t i = 0; i < n; i++) {
+    char b[4];
+    snprintf(b, sizeof(b), "%02X", p[i]);
+    if (i) s += ' ';
+    s += b;
+  }
+  if (len > cap) s += " ...";
+  return s;
+}
+
+String idleLevelText(uint8_t il) {
+  switch (il) {
+    case IDLE_HIGH: return "HIGH (correct)";
+    case IDLE_LOW: return "LOW - check A/B / bias";
+    case IDLE_UNSTABLE: return "UNSTABLE - floating / noisy";
+    default: return "not measured yet";
+  }
+}
+
+String modeText(uint8_t m) {
+  switch (m) {
+    case MODE_SCAN: return "Auto-scan";
+    case MODE_CONSOLE: return "USB console";
+    default: return "Bridging";
+  }
+}
+
+// ===================== Shared page chrome =====================
+const char PAGE_CSS[] PROGMEM = R"rawliteral(
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { font-family: Arial; background:#f5f7fa; margin:15px; }
+h2 { color:#00a5df; margin:4px 0 10px; }
+h3 { color:#087b7b; margin:4px 0 8px; font-size:16px; }
+.box { background:white; padding:12px; margin-bottom:15px; box-shadow:0 1px 4px rgba(0,0,0,0.2); overflow-x:auto; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th { background:#087b7b; color:white; padding:6px; }
+td { border:1px solid #2999c5; padding:5px; text-align:center; }
+td.l { text-align:left; }
+button { padding:8px 14px; background:#0099cc; color:white; border:none; margin:2px; border-radius:4px; cursor:pointer; }
+button:disabled { background:#9bbfcc; cursor:default; }
+.nav { background:#6f42c1; }
+.danger { background:#dc3545; }
+input, select { padding:6px; margin:3px 0; }
+input[type=text], input[type=password], input[type=number] { width:220px; max-width:95%; }
+.banner { background:#f8d7da; color:#721c24; padding:10px; margin:10px 0; }
+.ok { background:#d4edda; color:#155724; padding:8px; margin:8px 0; }
+.err { background:#f8d7da; color:#721c24; padding:8px; margin:8px 0; }
+.note { color:#666; font-size:12px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:6px; }
+.kv { background:#f0f6f9; padding:6px; border-radius:4px; font-size:13px; }
+.kv b { display:block; font-size:16px; color:#087b7b; }
+.health { padding:12px; color:white; font-size:20px; font-weight:bold; border-radius:4px; }
+.h-OK { background:#28a745; } .h-WARN { background:#e0a800; } .h-FAULT { background:#dc3545; } .h-IDLE { background:#6c757d; }
+.f { border-left:6px solid #6c757d; padding:6px 10px; margin:6px 0; background:#fafafa; }
+.f-FAULT { border-color:#dc3545; } .f-WARN { border-color:#e0a800; } .f-INFO { border-color:#17a2b8; } .f-OK { border-color:#28a745; }
+.f .t { font-weight:bold; }
+.f .d { font-size:13px; color:#333; margin-top:3px; }
+.r-OK { color:#155724; } .r-TIMEOUT, .r-CRCLENGTH, .r-FOREIGN, .r-NOTRTU { color:#dc3545; font-weight:bold; } .r-EXCEPTION, .r-WRONGID, .r-LATEREPLY, .r-BADFC { color:#b8860b; font-weight:bold; }
+.mono { font-family:monospace; font-size:12px; text-align:left; word-break:break-all; }
+.logbox { background:#111; color:#0f0; font-family:monospace; font-size:12px; padding:10px; max-height:220px; overflow-y:auto; border-radius:4px; }
+.bar { background:#e9ecef; height:18px; border-radius:4px; overflow:hidden; }
+.bar div { background:#0099cc; height:100%; width:0; }
+</style>
+)rawliteral";
+
+String pageHead(const String &title) {
+  String html = "<!DOCTYPE html><html><head><title>" + htmlEscape(title) + " - Modbus Dongle</title>";
+  html += FPSTR(PAGE_CSS);
+  html += "</head><body>";
+  return html;
+}
+
+String navBar() {
+  String html = "<h2>Modbus Dongle</h2>";
+  html += "<button class='nav' type='button' onclick=\"location.href='/'\">Diagnostics</button>";
+  html += "<button class='nav' type='button' onclick=\"location.href='/scan'\">Auto-scan</button>";
+  html += "<button class='nav' type='button' onclick=\"location.href='/settings'\">Settings</button>";
+  html += "<button class='danger' type='button' onclick=\"location.href='/logout'\">Log Out</button>";
+  if (webAuthUsingDefaults()) {
+    html += "<div class='banner'>Default web login in use - change it under Settings &rarr; Security.</div>";
+  }
+  return html;
+}
+
+// ===================== Login / Logout =====================
+void handleLoginPage() {
+  String html = pageHead("Login");
+  html += "<div class='box' style='max-width:360px;margin:60px auto;padding:20px'><h2>Modbus Dongle</h2>";
+  if (server.hasArg("locked")) {
+    html += "<div class='err'>Too many failed attempts - locked for " + String(WEB_LOGIN_LOCKOUT_MS / 1000) + " seconds.</div>";
+  } else if (server.hasArg("err")) {
+    html += "<div class='err'>Invalid username or password.</div>";
+  }
+  html += R"rawliteral(
+<form action="/login" method="POST">
+<input type="text" name="user" placeholder="Username" autofocus style="width:95%">
+<input type="password" name="pass" placeholder="Password" style="width:95%">
+<button type="submit" style="width:100%">Log In</button>
+</form>
+<p class="note">Locked out? Connect USB, open the dongle's COM port at <b>74880</b> baud in a serial terminal, and send <b>factory-reset-auth</b> to restore the default login and AP password without losing other settings.</p>
+</div></body></html>
+)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+void handleLoginPost() {
+  if (webLoginLockedOut()) {
+    server.sendHeader("Location", "/login?locked=1");
+    server.send(303);
+    return;
+  }
+
+  String user = server.arg("user");
+  String pass = server.arg("pass");
+
+  if (checkWebCredentials(user, pass)) {
+    webSessionToken = makeRandomHex(16);
+    webSessionLastActivity = millis();
+    webLoginFailCount = 0;
+    logKeyEvent("WEB LOGIN OK: %s", user.c_str());
+    server.sendHeader("Set-Cookie", "DGSESSION=" + webSessionToken + "; Path=/; HttpOnly");
+    server.sendHeader("Location", "/");
+    server.send(303);
+    return;
+  }
+
+  webLoginFailCount++;
+  if (webLoginFailCount >= WEB_LOGIN_MAX_FAILS) {
+    webLoginLockStart = millis();
+    logKeyEvent("WEB LOGIN LOCKED OUT (%lus after %d failures)", WEB_LOGIN_LOCKOUT_MS / 1000, webLoginFailCount);
+    server.sendHeader("Location", "/login?locked=1");
+  } else {
+    logKeyEvent("WEB LOGIN FAILED (attempt %d/%d)", webLoginFailCount, WEB_LOGIN_MAX_FAILS);
+    server.sendHeader("Location", "/login?err=1");
+  }
+  server.send(303);
+}
+
+void handleLogout() {
+  webSessionToken = "";
+  server.sendHeader("Set-Cookie", "DGSESSION=deleted; Path=/; Max-Age=0");
+  server.sendHeader("Location", "/login");
+  server.send(303);
+}
+
+// ===================== Diagnostics dashboard =====================
+const char DASHBOARD_BODY[] PROGMEM = R"rawliteral(
+<div class="box"><div id="health" class="health h-IDLE">Loading...</div><div id="findings"></div>
+<p class="note" id="conn"></p></div>
+
+<div class="box"><h3>Link</h3><div class="grid" id="link"></div></div>
+
+<div class="box"><h3>Bus totals <span class="note" id="since"></span></h3><div class="grid" id="totals"></div>
+<p><button class="danger" type="button" onclick="resetStats()">Reset statistics</button></p></div>
+
+<div class="box"><h3>Slaves</h3>
+<table><thead><tr><th>ID</th><th>Requests</th><th>OK</th><th>Success</th><th>Timeouts</th><th>CRC</th><th>Exceptions</th><th>Wrong ID</th><th>Late</th><th>Latency min / avg / max (ms)</th><th>Last reply</th><th>Status</th></tr></thead>
+<tbody id="slaves"></tbody></table></div>
+
+<div class="box"><h3>Recent transactions (newest first)</h3>
+<table><thead><tr><th>Age</th><th>ID</th><th>FC</th><th>Result</th><th>Latency (ms)</th><th>Request</th><th>Reply</th></tr></thead>
+<tbody id="txlog"></tbody></table></div>
+
+<div class="box"><h3>Status Log</h3><div class="logbox" id="events"></div></div>
+
+<p class="note" id="footer"></p>
+
+<script>
+const $=id=>document.getElementById(id);
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function kv(label,val){return '<div class="kv">'+esc(label)+'<b>'+esc(val)+'</b></div>';}
+function ago(s){if(s<0)return '-';if(s<60)return s+' s';if(s<3600)return Math.floor(s/60)+' min';return Math.floor(s/3600)+' h';}
+function render(d){
+  const h=$('health'); h.className='health h-'+d.health.level;
+  h.textContent=({OK:'Bus healthy',WARN:'Warnings',FAULT:'Fault detected',IDLE:'Waiting for traffic'})[d.health.level]+'  ('+d.link.line+', '+d.link.mode+')';
+  $('findings').innerHTML=d.health.findings.map(f=>'<div class="f f-'+f.sev+'"><div class="t">['+f.sev+'] '+esc(f.title)+'</div><div class="d">'+f.detail+'</div></div>').join('');
+  $('conn').textContent='Recommended master response timeout: '+d.recTimeoutMs+' ms';
+  const L=d.link;
+  $('link').innerHTML=kv('PC port',L.usbOpen?'Open':'Closed')+kv('Port settings',L.line+(L.fromHost?' (from PC)':' (default)'))+kv('Mode',L.mode)+kv('Bus idle level',L.idle)+kv('Last bus activity',L.lastActivityS<0?'never':ago(L.lastActivityS)+' ago')+kv('Diag reply timeout',L.diagTimeoutMs+' ms')+kv('WiFi AP',d.dev.ap+' / '+d.dev.apIp)+kv('Site WiFi',d.dev.sta)+kv('Uptime',ago(d.uptimeS))+kv('Free heap',d.heap+' B');
+  const T=d.totals;
+  $('since').textContent='(since '+ago(T.sinceS)+' ago)';
+  $('totals').innerHTML=[['Requests',T.requests],['Replies OK',T.ok],['Timeouts',T.timeouts],['CRC / length errors',T.crc],['Exceptions',T.exceptions],['Wrong slave ID',T.wrongSlave],['Late replies',T.late],['Broadcasts',T.broadcasts],['Foreign frames',T.foreign],['Noise bytes',T.noise],['Stray lead bytes',T.glitch],['Non-RTU requests',T.nonRtu],['UART framing err',T.frameErr],['UART parity err',T.parityErr],['Break events',T.breaks],['Overflows (RS485/USB)',T.uartOvf+' / '+T.usbOvf],['Bytes PC to bus',T.txBytes],['Bytes bus to PC',T.rxBytes]].map(x=>kv(x[0],x[1])).join('');
+  $('slaves').innerHTML=d.slaves.length?d.slaves.map(s=>'<tr><td><b>'+s.id+'</b></td><td>'+s.req+'</td><td>'+s.ok+'</td><td>'+s.pct+'%</td><td>'+s.to+'</td><td>'+s.crc+'</td><td>'+s.exc+(s.excList?' ('+esc(s.excList)+')':'')+'</td><td>'+s.ws+'</td><td>'+s.late+'</td><td>'+(s.latN?s.latMin+' / '+s.latAvg+' / '+s.latMax:'-')+'</td><td>'+(s.lastS<0?'never':ago(s.lastS)+' ago')+'</td><td class="r-'+(s.status=='OK'?'OK':(s.status=='NO REPLY'||s.status=='DOWN'?'TIMEOUT':'EXCEPTION'))+'">'+esc(s.status)+'</td></tr>').join(''):'<tr><td colspan="12">No requests seen yet</td></tr>';
+  $('txlog').innerHTML=d.log.length?d.log.map(t=>'<tr><td>'+ago(t.ageS)+'</td><td>'+t.id+'</td><td>'+t.fc+'</td><td class="r-'+t.res.replace(/[^A-Z]/g,'')+'">'+esc(t.res)+(t.exc?' '+t.exc:'')+'</td><td>'+(t.lat===''?'-':t.lat)+'</td><td class="mono">'+esc(t.req)+'</td><td class="mono">'+esc(t.rsp)+'</td></tr>').join(''):'<tr><td colspan="7">None yet</td></tr>';
+  $('events').innerHTML=d.events.map(e=>'<div>['+ago(e.ageS)+' ago] '+esc(e.msg)+'</div>').join('');
+  $('footer').textContent='Firmware '+d.fw+' - '+d.dev.host;
+}
+async function refresh(){
+  try{
+    const r=await fetch('/api/diag',{cache:'no-store'});
+    if(r.status==401){location.href='/login';return;}
+    render(await r.json());
+  }catch(e){$('conn').textContent='Connection lost - retrying...';}
+}
+async function resetStats(){
+  if(!confirm('Reset all statistics and the transaction log?'))return;
+  const r=await fetch('/api/resetStats',{method:'POST'});
+  if(r.status==401){location.href='/login';return;}
+  refresh();
+}
+setInterval(refresh,2000);refresh();
+</script>
+</body></html>
+)rawliteral";
+
+void handleRoot() {
+  if (!requireAuth()) return;
+  String html = pageHead("Diagnostics");
+  html += navBar();
+  html += FPSTR(DASHBOARD_BODY);
+  server.send(200, "text/html", html);
+}
+
+void handleApiDiag() {
+  if (!requireAuthApi()) return;
+  runDiagnosis();
+
+  uint32_t nowMs = millis();
+  String j;
+  j.reserve(12000);
+
+  j += "{\"fw\":\"" FW_VERSION "\",\"uptimeS\":" + String(nowMs / 1000);
+  j += ",\"heap\":" + String(ESP.getFreeHeap());
+
+  String sta = "not configured";
+  if (wifiConfig.ssid.length()) {
+    sta = (WiFi.status() == WL_CONNECTED) ? (wifiConfig.ssid + " / " + WiFi.localIP().toString() + " (" + String(WiFi.RSSI()) + " dBm)") : (wifiConfig.ssid + " - not connected");
+  }
+  j += ",\"dev\":{\"ap\":\"" + jsonEscape(deviceConfig.apSsid) + "\",\"apIp\":\"" + WiFi.softAPIP().toString() + "\",\"sta\":\"" + jsonEscape(sta) + "\",\"host\":\"" + hostnameString() + "\"}";
+
+  int32_t lastAct = snapG.lastActivityMs ? (int32_t)((nowMs - snapG.lastActivityMs) / 1000) : -1;
+  j += ",\"link\":{\"usbOpen\":" + String((bool)Serial ? "true" : "false");
+  j += ",\"line\":\"" + lineCodingText(activeCoding) + "\",\"fromHost\":" + String(lineCodingFromHost ? "true" : "false");
+  j += ",\"mode\":\"" + modeText(bridgeMode) + "\",\"idle\":\"" + idleLevelText(idleLevel) + "\"";
+  j += ",\"lastActivityS\":" + String(lastAct) + ",\"diagTimeoutMs\":" + String(diagResponseTimeoutMs) + "}";
+
+  // health
+  const char *level = sevName(overallSev >= SEV_WARN ? overallSev : (uint8_t)SEV_OK);
+  if (overallSev < SEV_WARN && snapG.requests == 0) level = "IDLE";
+  j += ",\"health\":{\"level\":\"" + String(level) + "\",\"findings\":[";
+  bool first = true;
+  for (int sev = SEV_FAULT; sev >= SEV_OK; sev--) {
+    for (int i = 0; i < findingCount; i++) {
+      if (findings[i].sev != sev) continue;
+      if (!first) j += ",";
+      first = false;
+      // detail may contain HTML entities (&Omega;) - title/detail are
+      // firmware-authored, user data inside is numbers / escaped text only.
+      j += "{\"sev\":\"" + String(sevName(sev)) + "\",\"title\":\"" + jsonEscape(findings[i].title) + "\",\"detail\":\"" + jsonEscape(findings[i].detail) + "\"}";
+    }
+  }
+  j += "]},\"recTimeoutMs\":" + String(recommendedTimeoutMs);
+
+  // totals
+  j += ",\"totals\":{\"requests\":" + String(snapG.requests) + ",\"ok\":" + String(snapG.ok) + ",\"timeouts\":" + String(snapG.timeouts);
+  j += ",\"crc\":" + String(snapG.crcErrors) + ",\"exceptions\":" + String(snapG.exceptions) + ",\"wrongSlave\":" + String(snapG.wrongSlave);
+  j += ",\"late\":" + String(snapG.lateReplies) + ",\"broadcasts\":" + String(snapG.broadcasts) + ",\"foreign\":" + String(snapG.foreignFrames);
+  j += ",\"noise\":" + String(snapG.noiseBytes) + ",\"glitch\":" + String(snapG.glitchBytes) + ",\"nonRtu\":" + String(snapG.nonRtuRequests);
+  j += ",\"frameErr\":" + String(snapG.uartFrameErrors) + ",\"parityErr\":" + String(snapG.uartParityErrors) + ",\"breaks\":" + String(snapG.uartBreaks);
+  j += ",\"uartOvf\":" + String(snapG.uartOverflows) + ",\"usbOvf\":" + String(snapG.usbOverflows);
+  j += ",\"txBytes\":" + String(snapG.txBytes) + ",\"rxBytes\":" + String(snapG.rxBytes);
+  j += ",\"sinceS\":" + String((nowMs - snapG.statsSinceMs) / 1000) + "}";
+
+  // slaves
+  j += ",\"slaves\":[";
+  first = true;
+  for (int id = 1; id < SLAVE_SLOTS; id++) {
+    const SlaveStats &s = snapSlaves[id];
+    if (s.requests == 0 && s.lateReplies == 0) continue;
+    if (!first) j += ",";
+    first = false;
+    uint32_t answered = s.ok + s.exceptions;
+    String pct = s.requests ? String(100.0f * answered / s.requests, 1) : String("0");
+    String status;
+    if (answered + s.badFunction == 0) status = s.crcErrors ? "GARBLED" : "NO REPLY";
+    else if (s.consecTimeouts >= diagDeadSlaveThreshold) status = "DOWN";
+    else if (s.timeouts || s.crcErrors || s.wrongSlave) status = "UNSTABLE";
+    else if (s.exceptions) status = "EXCEPTIONS";
+    else status = "OK";
+    String excList = "";
+    for (uint8_t c = 1; c < 16; c++) {
+      if (s.excMask & (1 << c)) {
+        if (excList.length()) excList += ",";
+        excList += String(c);
+      }
+    }
+    j += "{\"id\":" + String(id) + ",\"req\":" + String(s.requests) + ",\"ok\":" + String(s.ok) + ",\"pct\":\"" + pct + "\"";
+    j += ",\"to\":" + String(s.timeouts) + ",\"crc\":" + String(s.crcErrors) + ",\"exc\":" + String(s.exceptions) + ",\"excList\":\"" + excList + "\"";
+    j += ",\"ws\":" + String(s.wrongSlave) + ",\"late\":" + String(s.lateReplies) + ",\"latN\":" + String(s.latCount);
+    j += ",\"latMin\":\"" + msText(s.latMinUs) + "\",\"latAvg\":\"" + msText(s.latCount ? (uint32_t)(s.latSumUs / s.latCount) : 0) + "\",\"latMax\":\"" + msText(s.latMaxUs) + "\"";
+    j += ",\"lastS\":" + String(s.lastReplyMs ? (int32_t)((nowMs - s.lastReplyMs) / 1000) : -1) + ",\"status\":\"" + status + "\"}";
+  }
+  j += "]";
+
+  // transaction log, newest first
+  j += ",\"log\":[";
+  uint32_t n = min(snapLogTotal, (uint32_t)TXLOG_SIZE);
+  for (uint32_t k = 0; k < n; k++) {
+    const TxLogEntry &e = snapLog[(snapLogHead + TXLOG_SIZE - 1 - k) % TXLOG_SIZE];
+    if (k) j += ",";
+    bool hasLat = (e.result == TR_OK || e.result == TR_EXCEPTION || e.result == TR_BAD_FUNCTION);
+    j += "{\"ageS\":" + String((nowMs - e.ms) / 1000) + ",\"id\":" + String(e.slave) + ",\"fc\":" + String(e.fc);
+    j += ",\"res\":\"" + String(resultName(e.result)) + "\",\"exc\":" + String(e.excCode);
+    j += ",\"lat\":\"" + (hasLat ? msText(e.latencyUs) : String("")) + "\"";
+    j += ",\"req\":\"" + hexBytes(e.req, e.reqLen, TXLOG_REQ_BYTES) + "\",\"rsp\":\"" + hexBytes(e.rsp, e.rspLen, TXLOG_RSP_BYTES) + "\"}";
+  }
+  j += "]";
+
+  // key event log, newest first
+  j += ",\"events\":[";
+  {
+    char msgs[KEY_LOG_SIZE][KEY_LOG_MSG_LEN];
+    uint32_t times[KEY_LOG_SIZE];
+    uint8_t head, count;
+    portENTER_CRITICAL(&keyLogMux);
+    memcpy(msgs, keyLog, sizeof(msgs));
+    memcpy(times, keyLogTime, sizeof(times));
+    head = keyLogHead;
+    count = keyLogCount;
+    portEXIT_CRITICAL(&keyLogMux);
+    for (uint8_t k = 0; k < count; k++) {
+      uint8_t idx = (head + KEY_LOG_SIZE - 1 - k) % KEY_LOG_SIZE;
+      if (k) j += ",";
+      j += "{\"ageS\":" + String((nowMs - times[idx]) / 1000) + ",\"msg\":\"" + jsonEscape(String(msgs[idx])) + "\"}";
+    }
+  }
+  j += "]}";
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", j);
+}
+
+void handleApiResetStats() {
+  if (!requireAuthApi()) return;
+  resetStatistics();
+  logKeyEvent("STATISTICS RESET");
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// ===================== Auto-scan page =====================
+const char SCAN_BODY[] PROGMEM = R"rawliteral(
+<div class="box"><h3>Auto-scan: find devices with unknown settings</h3>
+<p class="note">The dongle takes over the bus and probes every slave ID with a "read 1 register" request at each selected baud rate and format. Any valid reply (data or exception) counts as a device found. <b>Stop your Modbus master software first</b> - data from the PC is discarded while the scan runs. The PC's port settings are restored afterwards.</p>
+<table style="width:auto"><tr><td class="l">Slave IDs</td><td class="l"><input type="number" id="idFrom" min="1" max="247" value="1" style="width:70px"> to <input type="number" id="idTo" min="1" max="247" value="247" style="width:70px"></td></tr>
+<tr><td class="l">Probe</td><td class="l"><select id="fc"><option value="3">FC03 Read Holding Register</option><option value="4">FC04 Read Input Register</option></select> address <input type="number" id="addr" min="0" max="65535" value="0" style="width:90px"></td></tr>
+<tr><td class="l">Reply timeout per probe</td><td class="l"><input type="number" id="timeout" min="20" max="2000" value="100" style="width:80px"> ms</td></tr>
+<tr><td class="l">Baud rates</td><td class="l" id="bauds"></td></tr>
+<tr><td class="l">Formats</td><td class="l" id="fmts"></td></tr>
+<tr><td class="l">Smart stop</td><td class="l"><label><input type="checkbox" id="stopFirst" checked> Stop after the first baud/format that finds devices (finishes that setting's ID range)</label></td></tr></table>
+<p id="estimate" class="note"></p>
+<button type="button" id="startBtn" onclick="startScan()">Start scan</button>
+<button type="button" class="danger" id="stopBtn" onclick="stopScan()" disabled>Stop</button>
+<div id="msg"></div></div>
+
+<div class="box"><h3>Progress</h3><div class="bar"><div id="bar"></div></div><p id="prog" class="note"></p></div>
+
+<div class="box"><h3>Devices found</h3>
+<table><thead><tr><th>Slave ID</th><th>Baud</th><th>Format</th><th>Reply</th><th>Latency (ms)</th></tr></thead><tbody id="results"></tbody></table>
+<div id="hints"></div></div>
+
+<script>
+const $=id=>document.getElementById(id);
+const BAUDS=[9600,19200,38400,115200,57600,4800,2400,1200];
+const BAUD_DEF=[9600,19200,38400,115200];
+const FMTS=[['N1','8N1'],['E1','8E1'],['O1','8O1'],['N2','8N2']];
+const FMT_DEF=['N1','E1'];
+$('bauds').innerHTML=BAUDS.map(b=>'<label style="margin-right:8px"><input type="checkbox" name="b" value="'+b+'"'+(BAUD_DEF.includes(b)?' checked':'')+'> '+b+'</label>').join('');
+$('fmts').innerHTML=FMTS.map(f=>'<label style="margin-right:8px"><input type="checkbox" name="f" value="'+f[0]+'"'+(FMT_DEF.includes(f[0])?' checked':'')+'> '+f[1]+'</label>').join('');
+function sel(n){return [...document.querySelectorAll('input[name='+n+']:checked')].map(x=>x.value);}
+function est(){
+  const ids=Math.max(0,(+$('idTo').value)-(+$('idFrom').value)+1), c=sel('b').length*sel('f').length, t=+$('timeout').value;
+  const s=Math.round(ids*c*(t+15)/1000);
+  $('estimate').textContent=c+' setting(s) x '+ids+' ID(s): worst case about '+(s<120?s+' s':Math.round(s/60)+' min')+(c>32?' - too many settings (max 32)':'');
+}
+document.querySelectorAll('input').forEach(i=>i.addEventListener('change',est));est();
+async function post(url,body){
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body||''});
+  if(r.status==401){location.href='/login';throw 0;}
+  return r.json();
+}
+async function startScan(){
+  const p=new URLSearchParams({idFrom:$('idFrom').value,idTo:$('idTo').value,fc:$('fc').value,addr:$('addr').value,timeout:$('timeout').value,bauds:sel('b').join(','),fmts:sel('f').join(','),stopFirst:$('stopFirst').checked?1:0});
+  const d=await post('/api/scan/start',p.toString());
+  $('msg').innerHTML=d.ok?'':'<div class="err">'+d.error+'</div>';
+  poll();
+}
+async function stopScan(){await post('/api/scan/stop');poll();}
+function fmtName(f){return '8'+f;}
+async function poll(){
+  let d;
+  try{const r=await fetch('/api/scan',{cache:'no-store'});if(r.status==401){location.href='/login';return;}d=await r.json();}catch(e){return;}
+  const running=d.state=='RUNNING';
+  $('startBtn').disabled=running;$('stopBtn').disabled=!running;
+  const pct=d.total?Math.round(100*d.done/d.total):0;
+  $('bar').style.width=(d.state=='DONE'?100:pct)+'%';
+  $('prog').textContent=d.state=='IDLE'?'No scan run yet.':(d.state+': '+d.done+' / '+d.total+' probes'+(running?' - now ID '+d.id+' at '+d.combo:'')+' - '+d.elapsedS+' s'+(d.dropped?' - '+d.dropped+' PC byte(s) discarded':''));
+  $('results').innerHTML=d.results.length?d.results.map(r=>'<tr><td><b>'+r.id+'</b></td><td>'+r.baud+'</td><td>'+r.fmt+'</td><td>'+(r.exc?'Exception '+r.exc+' (device present)':'Data')+'</td><td>'+r.lat+'</td></tr>').join(''):'<tr><td colspan="5">'+(d.state=='IDLE'?'-':'None yet')+'</td></tr>';
+  let h='';
+  if(d.garbled.length) h+='<div class="f f-WARN"><div class="t">Garbled replies at: '+d.garbled.join(', ')+'</div><div class="d">Something answered at these settings but no valid frame was decoded. A device is probably present at a nearby baud rate or a different parity/stop setting: include more baud rates/formats, or check for noise.</div></div>';
+  if(!running&&d.state!='IDLE'&&d.results.length==0) h+='<div class="f f-FAULT"><div class="t">No device answered</div><div class="d">Check power and A/B wiring (try swapping A and B), make sure no other master is polling, widen the ID range and add the remaining baud rates and formats. Some devices only answer FC04 or reject address 0 - an exception reply still counts as found.</div></div>';
+  if(d.results.length){const s=new Set(d.results.map(r=>r.baud+' '+r.fmt));h+='<div class="f f-OK"><div class="t">Use these port settings in your master: '+[...s].join(' / ')+'</div><div class="d">Open the COM port with these settings and poll the IDs listed above.</div></div>';}
+  $('hints').innerHTML=h;
+  if(running)setTimeout(poll,1000);
+}
+poll();
+</script>
+</body></html>
+)rawliteral";
+
+void handleScanPage() {
+  if (!requireAuth()) return;
+  String html = pageHead("Auto-scan");
+  html += navBar();
+  html += FPSTR(SCAN_BODY);
+  server.send(200, "text/html", html);
+}
+
+String comboText(const ScanCombo &c) {
+  String s = "8";
+  s += (c.parity == 1) ? 'O' : (c.parity == 2 ? 'E' : 'N');
+  s += (c.stopBits ? "2" : "1");
+  return s;
+}
+
+void sendScanError(const String &msg) {
+  server.send(200, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(msg) + "\"}");
+}
+
+void handleApiScanStart() {
+  if (!requireAuthApi()) return;
+
+  if (bridgeMode == MODE_SCAN || scanStartPending) return sendScanError("A scan is already running.");
+  if (bridgeMode == MODE_CONSOLE) return sendScanError("The PC has the port open in console mode (74880 baud).");
+
+  long idFrom = server.arg("idFrom").toInt();
+  long idTo = server.arg("idTo").toInt();
+  long fc = server.arg("fc").toInt();
+  long addr = server.arg("addr").toInt();
+  long timeoutMs = server.arg("timeout").toInt();
+  if (idFrom < 1 || idTo > 247 || idFrom > idTo) return sendScanError("Slave ID range must be within 1-247.");
+  if (fc != 3 && fc != 4) return sendScanError("Probe function must be 3 or 4.");
+  if (addr < 0 || addr > 65535) return sendScanError("Register address must be 0-65535.");
+  if (timeoutMs < 20 || timeoutMs > 2000) return sendScanError("Timeout must be 20-2000 ms.");
+
+  // Baud-major order, common settings first (the page sends them that way).
+  ScanRequest req;
+  memset(&req, 0, sizeof(req));
+  String bauds = server.arg("bauds") + ",";
+  String fmts = server.arg("fmts");
+  int start = 0;
+  while (true) {
+    int comma = bauds.indexOf(',', start);
+    if (comma < 0) break;
+    long baud = bauds.substring(start, comma).toInt();
+    start = comma + 1;
+    if (baud < MIN_BAUD || baud > MAX_BAUD) continue;
+    const char *codes[] = { "N1", "E1", "O1", "N2" };
+    const uint8_t par[] = { 0, 2, 1, 0 };
+    const uint8_t stop[] = { 0, 0, 0, 2 };
+    for (int f = 0; f < 4; f++) {
+      if (fmts.indexOf(codes[f]) < 0) continue;
+      if (req.comboCount >= SCAN_MAX_COMBOS) return sendScanError("Too many baud/format combinations (max 32).");
+      req.combos[req.comboCount].baud = baud;
+      req.combos[req.comboCount].parity = par[f];
+      req.combos[req.comboCount].stopBits = stop[f];
+      req.comboCount++;
+    }
+  }
+  if (req.comboCount == 0) return sendScanError("Select at least one baud rate and one format.");
+
+  req.idFrom = (uint8_t)idFrom;
+  req.idTo = (uint8_t)idTo;
+  req.fc = (uint8_t)fc;
+  req.addr = (uint16_t)addr;
+  req.timeoutMs = (uint16_t)timeoutMs;
+  req.stopAtFirstHit = server.arg("stopFirst") == "1";
+
+  portENTER_CRITICAL(&scanMux);
+  scanRequest = req;
+  portEXIT_CRITICAL(&scanMux);
+  scanStartPending = true;
+
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiScanStop() {
+  if (!requireAuthApi()) return;
+  if (bridgeMode == MODE_SCAN) scanStopPending = true;
+  scanStartPending = false;
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiScan() {
+  if (!requireAuthApi()) return;
+
+  static ScanStatus st;  // big-ish: keep it off the stack
+  ScanRequest req;
+  portENTER_CRITICAL(&scanMux);
+  st = scanStatus;
+  req = scanRequest;
+  portEXIT_CRITICAL(&scanMux);
+
+  const char *stateNames[] = { "IDLE", "RUNNING", "DONE", "STOPPED" };
+  uint8_t state = st.state;
+  if (scanStartPending && state != SCAN_RUNNING) state = SCAN_RUNNING;
+  uint32_t endMs = (st.state == SCAN_RUNNING || st.finishedMs == 0) ? millis() : st.finishedMs;
+
+  String j;
+  j.reserve(4096);
+  j += "{\"state\":\"" + String(stateNames[state < 4 ? state : 0]) + "\",\"done\":" + String(st.probesDone) + ",\"total\":" + String(st.probesTotal);
+  j += ",\"id\":" + String(st.currentId) + ",\"dropped\":" + String(st.droppedHostBytes);
+  j += ",\"elapsedS\":" + String(st.startedMs ? (endMs - st.startedMs) / 1000 : 0);
+  String combo = (st.comboIndex < req.comboCount) ? (String(req.combos[st.comboIndex].baud) + " " + comboText(req.combos[st.comboIndex])) : String("-");
+  j += ",\"combo\":\"" + combo + "\",\"results\":[";
+  for (uint8_t i = 0; i < st.resultCount; i++) {
+    const ScanResult &r = st.results[i];
+    if (i) j += ",";
+    j += "{\"id\":" + String(r.id) + ",\"baud\":" + String(r.combo.baud) + ",\"fmt\":\"" + comboText(r.combo) + "\",\"exc\":" + String(r.excCode) + ",\"lat\":\"" + msText(r.latencyUs) + "\"}";
+  }
+  j += "],\"garbled\":[";
+  bool first = true;
+  for (uint8_t c = 0; c < req.comboCount && c < 32; c++) {
+    if (!(st.garbledMask & (1UL << c))) continue;
+    if (!first) j += ",";
+    first = false;
+    j += "\"" + String(req.combos[c].baud) + " " + comboText(req.combos[c]) + "\"";
+  }
+  j += "]}";
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", j);
+}
+
+// ===================== Settings page =====================
+void handleSettings() {
+  if (!requireAuth()) return;
+
+  String html = pageHead("Settings");
+  html += navBar();
+
+  struct Msg { const char *arg; bool ok; const char *text; };
+  const Msg msgs[] = {
+    { "diagSaved", true, "Diagnostics settings saved." },
+    { "diagError", false, "Invalid diagnostics value." },
+    { "wifiSaved", true, "Site WiFi settings saved - connecting." },
+    { "deviceSaved", true, "Access Point settings saved - reconnect to the new AP if you changed it." },
+    { "apPassShort", false, "AP password must be at least 8 characters." },
+    { "apSsidBad", false, "AP name must be 1-32 characters." },
+    { "securitySaved", true, "Security settings saved." },
+    { "securityMismatch", false, "Passwords do not match." },
+    { "securityShort", false, "Password too short (minimum 4 characters)." },
+    { "saveError", false, "Saving to flash failed - settings may not survive a reboot." },
+  };
+  for (const Msg &m : msgs) {
+    if (server.hasArg(m.arg)) html += String("<div class='") + (m.ok ? "ok" : "err") + "'>" + m.text + "</div>";
+  }
+
+  // ---- Diagnostics ----
+  html += "<div class='box'><h3>Diagnostics</h3><form action='/saveDiag' method='POST'>";
+  html += "Reply timeout for statistics: <input type='number' name='rspTo' min='" + String(MIN_DIAG_RESPONSE_TIMEOUT_MS) + "' max='" + String(MAX_DIAG_RESPONSE_TIMEOUT_MS) + "' value='" + String(diagResponseTimeoutMs) + "'> ms<br>";
+  html += "<small class='note'>How long the dongle waits for a reply before counting a TIMEOUT. It does not change what the PC sees - set it to your master's response timeout so both agree. A reply that arrives later is counted as a LATE reply.</small><br>";
+  html += "Consecutive timeouts before a slave is reported DOWN: <input type='number' name='deadTh' min='1' max='1000' value='" + String(diagDeadSlaveThreshold) + "'><br>";
+  html += "<button type='submit'>Save Diagnostics</button></form></div>";
+
+  // ---- Site WiFi ----
+  html += "<div class='box'><h3>Site WiFi (optional)</h3><form action='/saveWifi' method='POST'>";
+  html += "Status: ";
+  if (wifiConfig.ssid.length() == 0) html += "not configured";
+  else if (WiFi.status() == WL_CONNECTED) html += "connected, IP " + WiFi.localIP().toString() + " (" + String(WiFi.RSSI()) + " dBm)";
+  else html += "not connected";
+  html += "<br>SSID: <input type='text' name='ssid' maxlength='32' value='" + htmlEscape(wifiConfig.ssid) + "'><br>";
+  html += "Password: <input type='password' name='pass' maxlength='63' placeholder='(unchanged)'><br>";
+  html += "<label><input type='checkbox' name='forget' value='1'> Forget the site network</label><br>";
+  html += "<small class='note'>Joins your site network in addition to the dongle's own Access Point, so the diagnostics page can also be reached at the IP shown above. Leave the password blank to keep the current one.</small><br>";
+  html += "<button type='submit'>Save WiFi</button></form></div>";
+
+  // ---- Access Point ----
+  html += "<div class='box'><h3>Device Access Point</h3><form action='/saveDevice' method='POST'>";
+  html += "AP name (SSID): <input type='text' name='apSsid' maxlength='32' value='" + htmlEscape(deviceConfig.apSsid) + "'><br>";
+  html += "AP password: <input type='password' name='apPassword' maxlength='63' placeholder='(unchanged)'><br>";
+  html += "<small class='note'>WPA2 key for this dongle's own hotspot (minimum 8 characters). Address: http://192.168.4.1. If you forget it, open the COM port at <b>74880</b> baud and send <b>factory-reset-auth</b>.</small><br>";
+  html += "<button type='submit'>Save Access Point</button></form></div>";
+
+  // ---- Security ----
+  html += "<div class='box'><h3>Security</h3><form action='/saveSecurity' method='POST'>";
+  if (webAuthUsingDefaults()) html += "<div class='banner'>Default login (admin/admin) in use - set your own password.</div>";
+  html += "Username: <input type='text' name='webUser' maxlength='32' value='" + htmlEscape(authConfig.user) + "'><br>";
+  html += "New password: <input type='password' name='webPass' maxlength='64'><br>";
+  html += "Confirm password: <input type='password' name='webPass2' maxlength='64'><br>";
+  html += "<small class='note'>Leave the password fields blank to keep the current password. Login sessions time out after " + String(WEB_SESSION_TIMEOUT_MS / 60000) + " minutes idle; " + String(WEB_LOGIN_MAX_FAILS) + " failed logins lock the login page for " + String(WEB_LOGIN_LOCKOUT_MS / 1000) + " s. Forgot the password? Open the COM port at <b>74880</b> baud and send <b>factory-reset-auth</b>: it restores the default login and AP password without touching other settings.</small><br>";
+  html += "<button type='submit'>Save Security</button></form></div>";
+
+  // ---- Device info ----
+  html += "<div class='box'><h3>Device</h3>";
+  html += "Firmware: " FW_VERSION "<br>Hostname: " + hostnameString() + "<br>AP MAC: " + WiFi.softAPmacAddress() + "<br>";
+  html += "RS485: RX=D2 TX=D3 DE/RE=D4 &middot; Port settings follow the PC (default 9600 8N1)<br>";
+  html += "<form action='/reboot' method='POST' onsubmit=\"return confirm('Reboot the dongle?')\"><button class='danger' type='submit'>Reboot</button></form></div>";
+
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSaveDiag() {
+  if (!requireAuth()) return;
+  long to = server.arg("rspTo").toInt();
+  long th = server.arg("deadTh").toInt();
+  if (to < MIN_DIAG_RESPONSE_TIMEOUT_MS || to > MAX_DIAG_RESPONSE_TIMEOUT_MS || th < 1 || th > 1000) {
+    server.sendHeader("Location", "/settings?diagError=1");
+    server.send(303);
+    return;
+  }
+  diagResponseTimeoutMs = (uint32_t)to;
+  diagDeadSlaveThreshold = (uint16_t)th;
+  bool ok = saveDiagConfig();
+  logKeyEvent("DIAG SETTINGS SAVED: timeout=%ldms down-after=%ld", to, th);
+  server.sendHeader("Location", ok ? "/settings?diagSaved=1" : "/settings?saveError=1");
+  server.send(303);
+}
+
+void handleSaveWifi() {
+  if (!requireAuth()) return;
+  if (server.arg("forget") == "1") {
+    wifiConfig.ssid = "";
+    wifiConfig.password = "";
+  } else {
+    String ssid = server.arg("ssid");
+    ssid.trim();
+    if (ssid != wifiConfig.ssid) wifiConfig.password = "";
+    wifiConfig.ssid = ssid;
+    if (server.arg("pass").length() > 0) wifiConfig.password = server.arg("pass");
+  }
+  bool ok = saveWifiConfig();
+  logKeyEvent("WIFI SETTINGS SAVED: %s", wifiConfig.ssid.length() ? wifiConfig.ssid.c_str() : "(none)");
+
+  WiFi.disconnect();
+  lastWifiConnected = false;
+  lastWifiAttempt = millis();
+  connectSiteWiFi();
+
+  server.sendHeader("Location", ok ? "/settings?wifiSaved=1" : "/settings?saveError=1");
+  server.send(303);
+}
+
+void handleSaveDevice() {
+  if (!requireAuth()) return;
+  String apSsid = server.arg("apSsid");
+  apSsid.trim();
+  if (apSsid.length() < 1 || apSsid.length() > 32) {
+    server.sendHeader("Location", "/settings?apSsidBad=1");
+    server.send(303);
+    return;
+  }
+  bool apPassChanged = false;
+  if (server.arg("apPassword").length() > 0) {
+    if (server.arg("apPassword").length() < AP_PASSWORD_MIN_LEN) {
+      server.sendHeader("Location", "/settings?apPassShort=1");
+      server.send(303);
+      return;
+    }
+    deviceConfig.apPassword = server.arg("apPassword");
+    apPassChanged = true;
+  }
+  deviceConfig.apSsid = apSsid;
+  bool ok = saveDeviceConfig();
+  logKeyEvent("AP SETTINGS SAVED: %s%s", apSsid.c_str(), apPassChanged ? " (password changed)" : "");
+
+  server.sendHeader("Location", ok ? "/settings?deviceSaved=1" : "/settings?saveError=1");
+  server.send(303);
+  delay(200);
+  WiFi.softAP(deviceConfig.apSsid.c_str(), deviceConfig.apPassword.c_str());
+}
+
+void handleSaveSecurity() {
+  if (!requireAuth()) return;
+
+  String user = server.arg("webUser");
+  String pass1 = server.arg("webPass");
+  String pass2 = server.arg("webPass2");
+  user.trim();
+
+  if (pass1 != pass2) {
+    server.sendHeader("Location", "/settings?securityMismatch=1");
+    server.send(303);
+    return;
+  }
+  if (pass1.length() > 0 && pass1.length() < WEB_PASSWORD_MIN_LEN) {
+    server.sendHeader("Location", "/settings?securityShort=1");
+    server.send(303);
+    return;
+  }
+
+  if (user.length() > 0) authConfig.user = user;
+  if (pass1.length() > 0) {
+    authConfig.salt = makeRandomHex(8);
+    authConfig.passHash = sha256Hex(authConfig.salt + pass1);
+  }
+
+  bool ok = saveAuthConfig();
+  logKeyEvent("SECURITY SETTINGS SAVED: web user=%s %s", authConfig.user.c_str(), pass1.length() ? "(password changed)" : "(password unchanged)");
+
+  // The admin who just changed the password stays logged in.
+  server.sendHeader("Location", ok ? "/settings?securitySaved=1" : "/settings?saveError=1");
+  server.send(303);
+}
+
+void handleReboot() {
+  if (!requireAuth()) return;
+  logKeyEvent("REBOOT REQUESTED FROM WEB");
+  server.send(200, "text/html", pageHead("Reboot") + "<div class='box'>Rebooting... <a href='/'>reconnect</a> in a few seconds.</div></body></html>");
+  delay(500);
+  ESP.restart();
+}
+
+void handleNotFound() {
+  server.sendHeader("Location", "/");
+  server.send(302);
+}
+
+// ===================== USB console (credential recovery) =====================
+// Reached by opening the COM port at CONSOLE_BAUD. Runs in bridgeTask (the
+// sole owner of the USB data port), never concurrently with bridging.
+void consoleBanner() {
+  Serial.println();
+  Serial.println("=== Modbus Dongle console (firmware " FW_VERSION ") ===");
+  Serial.println("Nothing is bridged while the port is open at 74880 baud.");
+  Serial.println("Commands: status, factory-reset-auth, reboot, help");
+}
+
+void consoleStatus() {
+  GlobalStats g;
+  portENTER_CRITICAL(&statsMux);
+  memcpy(&g, &gstats, sizeof(g));
+  portEXIT_CRITICAL(&statsMux);
+
+  Serial.printf("Firmware      : %s\r\n", FW_VERSION);
+  Serial.printf("Uptime        : %lu s\r\n", (unsigned long)(millis() / 1000));
+  Serial.printf("Access Point  : %s  http://%s\r\n", deviceConfig.apSsid.c_str(), WiFi.softAPIP().toString().c_str());
+  if (wifiConfig.ssid.length()) {
+    Serial.printf("Site WiFi     : %s  %s\r\n", wifiConfig.ssid.c_str(), WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "(not connected)");
+  } else {
+    Serial.println("Site WiFi     : not configured");
+  }
+  Serial.printf("Web login     : %s%s\r\n", authConfig.user.c_str(), webAuthUsingDefaults() ? " (default password)" : "");
+  Serial.printf("Health        : %s\r\n", sevName(healthLevel));
+  Serial.printf("Requests %lu  OK %lu  Timeouts %lu  CRC %lu  Exceptions %lu\r\n",
+                (unsigned long)g.requests, (unsigned long)g.ok, (unsigned long)g.timeouts,
+                (unsigned long)g.crcErrors, (unsigned long)g.exceptions);
+}
+
+void consoleProcess() {
+  static String buf = "";
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      buf.trim();
+      if (buf == "factory-reset-auth") {
+        preferences.begin("auth", false);
+        preferences.clear();
+        preferences.end();
+        deviceConfig.apPassword = DEFAULT_AP_PASSWORD;
+        saveDeviceConfig();
+        Serial.println("AUTH RESET OK: web login back to " WEB_AUTH_DEFAULT_USER "/" WEB_AUTH_DEFAULT_PASS ", AP password back to " DEFAULT_AP_PASSWORD " - rebooting");
+        Serial.flush();
+        delay(500);
+        ESP.restart();
+      } else if (buf == "status") {
+        consoleStatus();
+      } else if (buf == "reboot") {
+        Serial.println("Rebooting...");
+        Serial.flush();
+        delay(300);
+        ESP.restart();
+      } else if (buf == "help" || buf.length() > 0) {
+        if (buf != "help") Serial.println("Unknown command.");
+        consoleBanner();
+      }
+      buf = "";
+    } else if (buf.length() < 64) {
+      buf += c;
+    }
+  }
+}
+
+// ===================== Setup / webTask =====================
+void setupWeb() {
+  String host = hostnameString();
+  WiFi.setHostname(host.c_str());  // must be set before WiFi starts
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  WiFi.softAP(deviceConfig.apSsid.c_str(), deviceConfig.apPassword.c_str());
+  logKeyEvent("AP STARTED: %s %s", deviceConfig.apSsid.c_str(), WiFi.softAPIP().toString().c_str());
+  connectSiteWiFi();
+  lastWifiAttempt = millis();
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/scan", HTTP_GET, handleScanPage);
+  server.on("/settings", HTTP_GET, handleSettings);
+  server.on("/api/diag", HTTP_GET, handleApiDiag);
+  server.on("/api/resetStats", HTTP_POST, handleApiResetStats);
+  server.on("/api/scan", HTTP_GET, handleApiScan);
+  server.on("/api/scan/start", HTTP_POST, handleApiScanStart);
+  server.on("/api/scan/stop", HTTP_POST, handleApiScanStop);
+  server.on("/saveDiag", HTTP_POST, handleSaveDiag);
+  server.on("/saveWifi", HTTP_POST, handleSaveWifi);
+  server.on("/saveDevice", HTTP_POST, handleSaveDevice);
+  server.on("/saveSecurity", HTTP_POST, handleSaveSecurity);
+  server.on("/reboot", HTTP_POST, handleReboot);
+  server.on("/login", HTTP_GET, handleLoginPage);
+  server.on("/login", HTTP_POST, handleLoginPost);
+  server.on("/logout", HTTP_GET, handleLogout);
+  server.onNotFound(handleNotFound);
+
+  // WebServer only exposes headers it was told to collect BEFORE begin().
+  const char *collectHeaderKeys[] = { "Cookie" };
+  server.collectHeaders(collectHeaderKeys, 1);
+  server.begin();
+  logKeyEvent("WEB SERVER STARTED");
+}
+
+void webTask(void *arg) {
+  unsigned long lastDiag = 0;
+  for (;;) {
+    server.handleClient();
+    handleWifiRetry();
+
+    // Keeps the LED verdict current even when no browser is open.
+    if (millis() - lastDiag >= 2000) {
+      lastDiag = millis();
+      runDiagnosis();
+    }
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+}

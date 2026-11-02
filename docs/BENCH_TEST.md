@@ -1,6 +1,6 @@
 # Bench Test Procedure: USB ⇄ RS485 Dongle (Arduino Nano ESP32)
 
-This procedure checks the `UsbRs485Dongle` firmware on the Gateway board hardware
+This procedure checks the `UsbRs485Dongle` firmware (v1.1: converter + WiFi diagnostics + auto-scan) on the Gateway board hardware
 before it's used in the field. Run the tests in order, because later tests assume
 the earlier ones passed. Record the results in the table in §9.
 
@@ -173,7 +173,72 @@ If the analyser can't capture this, record the scope screenshots or "N/A".
 
 ---
 
-## 8. LED behaviour
+## 8. Web page and login
+
+Connect a phone or laptop to the dongle's WiFi and open **http://192.168.4.1**.
+
+| Test | Steps | Pass criterion |
+|---|---|---|
+| **W1 AP visible** | Scan for WiFi networks after boot | **ModbusDongle** is listed. It connects with password **12345678** |
+| **W2 Login required** | Open `http://192.168.4.1/` while logged out | Redirected to the login page |
+| **W3 Default login** | Log in with admin / admin | Diagnostics page opens with the red *Default web login in use* banner |
+| **W4 Change password** | Settings → Security: set a new password (≥ 4 characters, typed twice) and save. Log out, then log in with the new password | Saved message shown. Old password rejected, new one accepted. Banner gone |
+| **W5 Lockout** | Log out and enter a wrong password 5 times | The 5th attempt shows *locked for 60 seconds*. The correct password is refused until 60 s have passed |
+| **W6 Session timeout** | Log in, leave the page closed for 31 min, then reload | Back at the login page |
+| **W7 Live refresh** | Run F1 with `--repeat 100` while watching the Diagnostics page | Requests and OK counters rise every 2 s. The Slave 1 row and *Recent transactions* fill in. Health = **Bus healthy** |
+| **W8 No impact on bridging** | Repeat R1 (5000 requests) with the Diagnostics page open and refreshing | Same pass criterion as R1. The page counters match the script (requests = 5000, OK = script OK count) |
+| **W9 Site WiFi (optional)** | Settings → Site WiFi: enter your network and save | Within about 30 s the Settings page shows *connected, IP x.x.x.x*. The page also opens at that IP. The AP keeps working |
+| **W10 AP settings** | Change the AP name and password, then reconnect | The new AP name and password work. A password shorter than 8 characters is rejected |
+| **W11 Settings survive reboot** | Settings → Reboot, wait, log in | Password, AP and diagnostic settings are unchanged |
+| **W12 Credential recovery** | Close the master software. Open the COM port at **74880** baud in a serial terminal and type `status`, then `factory-reset-auth` | `status` prints the AP name, IP and counters. The reset prints *AUTH RESET OK* and reboots. Login is admin/admin and the AP password is 12345678 again. Diagnostic settings and site WiFi are kept |
+| **W13 Console doesn't bridge** | While in 74880 console mode, watch the RS485 TX line or the slave | Nothing is transmitted on RS485 |
+
+---
+
+## 9. Diagnosis tests (deliberate faults)
+
+Start each test with **Reset statistics** on the Diagnostics page. Then create
+the fault, poll with F1 (`--repeat 20` unless stated) and read the **findings**
+at the top of the page. The expected verdict is the minimum. Other findings
+caused by the same fault are acceptable.
+
+| Test | Fault to create | Expected finding (verdict) |
+|---|---|---|
+| **D1 Healthy baseline** | None. F1 with `--repeat 50` | **Bus healthy** (OK), success 100 %, plus a recommended master timeout. Idle level **HIGH (correct)** |
+| **D2 Wrong slave ID** | Poll `--slave 77` (no such device) | **Slave 77 never answers** (FAULT), with the wiring/ID/settings checklist |
+| **D3 Wrong baud rate** | Slave at 19200, master opens at 9600 | **Slave N never answers** or **every reply is corrupted** (FAULT), mentioning baud/parity mismatch. Usually also **UART framing/parity errors** (WARN) |
+| **D4 Wrong parity** | Slave at 9600 E1, master at 9600 N1 | As D3. The finding names the PC's port settings (`9600 8N1`) |
+| **D5 A/B swapped** | Swap the A and B wires (bus with bias resistors) | **RS485 bus idles LOW** (FAULT) within about 3 s of the bus going quiet. Polls fail. Restore the wiring: the idle level goes back to HIGH (Reset statistics to clear old findings) |
+| **D6 Device stops** | Poll continuously (`--repeat 200`), then power off the slave halfway | **Slave N stopped responding** (FAULT), showing how many requests succeeded first |
+| **D7 Illegal address** | `--addr 9999` (or any register the device doesn't have) | **Illegal data address (exception 02)** (WARN), with the 0-based / 4xxxx numbering hint |
+| **D8 Unsupported function** | Poll with a function code the device lacks (e.g. FC04 on a holding-register-only device) | **Function not supported (exception 01)** (WARN) |
+| **D9 Second master** | Connect a second master (e.g. another USB-RS485 adapter running Modbus Poll) to the same bus and let it poll while the dongle is idle | **Another device is talking on the bus** (WARN) |
+| **D10 Slow slave / short timeout** | Set Settings → Diagnostics reply timeout to 20 ms and poll a slave that answers in > 20 ms | Timeouts are counted, then **LATE REPLY** entries appear in *Recent transactions* and **intermittent timeouts** (WARN) recommends a longer master timeout. Set the timeout back to 1000 ms afterwards |
+| **D11 Noise / termination** (optional) | Long cable without termination, or a noise source next to the cable | **Corrupted replies** or **Noise between frames** (WARN), with the termination/shielding advice |
+| **D12 Non-RTU traffic** | Send ASCII text from a serial terminal at 9600 (e.g. `hello`) | **PC traffic is not Modbus RTU** (INFO) |
+| **D13 LED verdict** | During D2 (FAULT) and D7 (WARN), with no polling running | Red blink every 2 s (FAULT), yellow blink every 2 s (WARN) |
+
+---
+
+## 10. Auto-scan tests
+
+Stop the Modbus master software before each scan (closing the COM port is enough).
+
+| Test | Steps | Pass criterion |
+|---|---|---|
+| **S1 Find a known device** | Slave at 9600 8N1, ID 1. Auto-scan with the defaults (IDs 1–247, 9600/19200/38400/115200 × 8N1/8E1, smart stop on) | ID 1 is listed at **9600 8N1** within about 30 s. The scan stops after that setting. The page suggests *Use these port settings: 9600 8N1* |
+| **S2 Find unknown settings** | Set the slave to 19200 8E1, ID 23 (don't tell the scanner). Run S1's scan again | ID 23 found at **19200 8E1**. The earlier settings may be listed under *Garbled replies at* |
+| **S3 Several devices** | Two or more slaves with different IDs, same settings | All IDs are found in one scan |
+| **S4 Exception counts as found** | Probe an address the device doesn't have (e.g. address 9999) | The device is still listed, with *Exception 2 (device present)* |
+| **S5 Stop button** | Start a full-range scan and press **Stop** after about 10 s | The state changes to STOPPED within about 1 s and the results so far are kept |
+| **S6 Nothing on the bus** | Disconnect A/B and scan IDs 1–10 | *No device answered* with the wiring checklist |
+| **S7 PC settings restored** | After S1, open the master at 9600 8N1 and run F1 | F1 passes. The Diagnostics page shows the PC's settings again |
+| **S8 PC data during scan** | Start a scan, then run F1 against the dongle while it scans | F1 gets no replies. After the scan, the Diagnostics page shows *PC data was discarded during a scan* (INFO). Nothing from the PC was sent on the bus |
+| **S9 Validation** | Try ID range 0–300, a timeout of 5 ms, and no baud rate selected | Each is refused with a clear message. No scan starts |
+
+---
+
+## 11. LED behaviour
 
 | Test | Condition | Expected LED |
 |---|---|---|
@@ -181,10 +246,13 @@ If the analyser can't capture this, record the scope screenshots or "N/A".
 | **E2** | F1 running | Blue flash (TX), then green flash (RX) on each poll |
 | **E3** | Slave disconnected, F1 running | Blue flashes only |
 | **E4** | Open the port with **mark** parity (e.g. pyserial `parity='M'`) | Red flash about 0.5 s. Traffic continues with no parity |
+| **E5** | Diagnosis verdict FAULT (e.g. D2), bus quiet | Red blink every 2 s |
+| **E6** | Diagnosis verdict WARN (e.g. D7), bus quiet | Yellow blink every 2 s |
+| **E7** | Auto-scan running | Purple blink every 1 s, plus blue/green flashes per probe |
 
 ---
 
-## 9. Results record
+## 12. Results record
 
 | Test | Result (Pass / Fail / N/A) | Notes / measured values |
 |---|---|---|
@@ -216,13 +284,16 @@ If the analyser can't capture this, record the scope screenshots or "N/A".
 | R6 Bus disconnect | | |
 | R7 A/B swap | | |
 | R8 Thermal | | |
-| E1–E4 LEDs | | |
+| W1–W13 Web / login | | Failed: |
+| D1–D13 Diagnosis | | Failed: |
+| S1–S9 Auto-scan | | Failed: |
+| E1–E7 LEDs | | |
 
 **Overall verdict:** ☐ PASS  ☐ FAIL. Signed: __________  Date: __________
 
 ---
 
-## 10. Troubleshooting
+## 13. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
@@ -232,5 +303,9 @@ If the analyser can't capture this, record the scope screenshots or "N/A".
 | Fails only at low baud with "first byte missing" | Check T6b. DE must drop right after the last stop bit |
 | Fails only at high baud | Cable length or termination, or the transceiver's rated speed (MAX485 ≈ 2.5 Mbps max, some clones much lower) |
 | CRC errors that come and go under load (R1/R2) | Termination or biasing missing, ground loop, or noisy cable. Retest with a short bench cable |
+| Web page doesn't open | Check you are connected to the **ModbusDongle** WiFi and browsing to `http://192.168.4.1` (not https). Mobile phones may drop a WiFi network that has no internet access: turn off mobile data or tell the phone to stay connected |
+| Forgot the web or AP password | Open the COM port at **74880** baud and send `factory-reset-auth` (W12) |
+| Findings from an earlier fault still shown | Counters are cumulative: press **Reset statistics** after fixing a fault |
+| Every poll shows TIMEOUT on the page but the master gets replies | The diagnostic reply timeout is shorter than the slave's reply time. Raise it under Settings → Diagnostics |
 | Board vanishes when the port opens at 1200 baud | Expected: the 1200-baud bootloader touch (see L-note) |
 | Can't upload any more | Double-tap the reset button to enter the bootloader, then upload |
