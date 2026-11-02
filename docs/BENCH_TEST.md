@@ -4,6 +4,9 @@ This procedure checks the `UsbRs485Dongle` firmware (v1.2: converter + WiFi diag
 before it's used in the field. Run the tests in order, because later tests assume
 the earlier ones passed. Record the results in the table in §9.
 
+Testing from a Raspberry Pi? Follow [`RASPBERRY_PI_SOP.md`](RASPBERRY_PI_SOP.md):
+it carries out these tests step by step from a Pi terminal.
+
 | Item | Value |
 |---|---|
 | Firmware commit | `git rev-parse --short HEAD` → ________ |
@@ -225,7 +228,7 @@ finding clears.
 | **D7 Illegal address** | `--addr 9999` (or any register the device doesn't have) | **Illegal data address (exception 02)** (WARN), with the 0-based / 4xxxx numbering hint |
 | **D8 Unsupported function** | Poll with a function code the device lacks (e.g. FC04 on a holding-register-only device) | **Function not supported (exception 01)** (WARN) |
 | **D9 Second master** | Connect a second master (e.g. another USB-RS485 adapter running Modbus Poll) to the same bus and let it poll while the dongle is idle | **Another device is talking on the bus** (WARN) |
-| **D10 Slow slave / short timeout** | Set Settings → Diagnostics reply timeout to 20 ms and poll a slave that answers in > 20 ms | Timeouts are counted, then **LATE REPLY** entries appear in *Recent transactions* and **intermittent timeouts** (WARN) recommends a longer master timeout. Set the timeout back to 1000 ms afterwards |
+| **D10 Slow slave / short timeout** | Set Settings → Diagnostics reply timeout to 20 ms and poll a slave that answers in > 20 ms | **LATE REPLY** entries appear in *Recent transactions*. If every reply is late: **every reply arrives too late** (FAULT). If only some are late: **intermittent timeouts** (WARN). Either way it recommends a longer master timeout. Set the timeout back to 1000 ms afterwards |
 | **D11 Noise / termination** (optional) | Long cable with the **sensor-end** 120 Ω removed, or a noise source next to the cable | **Corrupted replies** or **Noise between frames** (WARN), with the termination/shielding advice |
 | **D12 Non-RTU traffic** | Send ASCII text from a serial terminal at 9600 (e.g. `hello`) | **PC traffic is not Modbus RTU** (INFO) |
 | **D13 LED verdict** | During D2 (FAULT) and D7 (WARN), with no polling running | Red blink every 2 s (FAULT), yellow blink every 2 s (WARN) |

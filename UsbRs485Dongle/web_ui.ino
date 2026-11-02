@@ -639,7 +639,15 @@ void runDiagnosis() {
     }
 
     if (replies == 0 && s.requests >= 3) {
-      if (s.crcErrors > 0) {
+      if (s.lateReplies > 0) {
+        addFinding(SEV_FAULT, sid + ": every reply arrives too late",
+                   "The device does answer (" + String(s.lateReplies) + " late reply(ies)), but only after the reply timeout of " + String(diagResponseTimeoutMs) + " ms, so every request counts as a timeout.",
+                   "Increase the master's response timeout (try 1000 ms, then reduce it step by step).\n"
+                   "Set the dongle's diagnostic reply timeout (Settings) to the same value.\n"
+                   "Make the poll interval longer than the response timeout.\n"
+                   "If the device is behind a gateway or radio link, allow for its extra delay.\n"
+                   "Press Reset statistics and poll again: the finding should change to Bus healthy, with a recommended timeout.", ACT_SETTINGS);
+      } else if (s.crcErrors > 0) {
         addFinding(SEV_FAULT, sid + ": every reply is corrupted",
                    "Bytes come back but never as a valid frame. This is almost always a baud rate / parity / stop-bit mismatch (the PC port is set to " + line + ").",
                    STEPS_SETTINGS_MISMATCH(line) + "\nIf the settings definitely match, treat it as noise: " STEPS_NOISE, ACT_SCAN);

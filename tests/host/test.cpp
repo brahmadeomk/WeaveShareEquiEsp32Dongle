@@ -102,5 +102,14 @@ int main(){
     CHECK(detectScoreCur==1);
     bridgeMode = MODE_BRIDGE;
   }
+  // ===== 17) Every reply late -> "arrives too late", not "never answers" =====
+  {
+    resetStatistics(); analyzerAbort(); bridgeMode = MODE_BRIDGE; diagResponseTimeoutMs = 100;
+    for(int i=0;i<5;i++){ sendReq({3,3,0,0,0,1}); idle(150); rx({3,3,2,0,1}); idle(30); }
+    runDiagnosis(); bool late=false, never=false;
+    for(int i=0;i<findingCount;i++){ if(findings[i].title=="Slave 3: every reply arrives too late") late=true; if(findings[i].title=="Slave 3 never answers") never=true; }
+    CHECK(slaveStats[3].lateReplies==5); CHECK(late); CHECK(!never);
+    diagResponseTimeoutMs = 1000;
+  }
   printf(fails? "%d FAILED\n" : "ALL PASSED\n", fails); return fails;
 }

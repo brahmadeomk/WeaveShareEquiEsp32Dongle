@@ -384,7 +384,18 @@ python tools/modbus_rtu_test.py COM5 --baud 9600 --parity N --slave 1 --fc 3 --a
 ```
 
 The full bench test procedure, with pass criteria and a results sheet, is in
-[`docs/BENCH_TEST.md`](docs/BENCH_TEST.md). It includes deliberate fault tests,
+[`docs/BENCH_TEST.md`](docs/BENCH_TEST.md).
+
+**Testing from a Raspberry Pi:** [`docs/RASPBERRY_PI_SOP.md`](docs/RASPBERRY_PI_SOP.md) is a
+step-by-step SOP. It goes from finding the port (`/dev/ttyACM0`,
+`/dev/serial/by-id/...`) through every test, all from a Pi terminal, using
+these tools:
+
+| Tool | Purpose |
+|---|---|
+| `tools/modbus_rtu_test.py` | Modbus master: read registers through the dongle (`--repeat`, `--interval`, `--quiet` for soak tests) |
+| `tools/modbus_slave_sim.py` | Modbus RTU slave simulator for a second USB-RS485 adapter (pyserial only) |
+| `tools/dongle_cli.py` | Diagnosis (findings + remedies + slave table), auto-scan and sniffer from the command line, over WiFi (standard library only) | It includes deliberate fault tests,
 such as swapped A/B, a wrong baud rate or a second master, that check each
 diagnosis.
 
