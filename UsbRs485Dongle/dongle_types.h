@@ -32,7 +32,7 @@ enum TxResult : uint8_t {
 
 enum IdleLevel : uint8_t { IDLE_UNKNOWN = 0, IDLE_HIGH, IDLE_LOW, IDLE_UNSTABLE };
 
-enum BridgeMode : uint8_t { MODE_BRIDGE = 0, MODE_SCAN, MODE_CONSOLE };
+enum BridgeMode : uint8_t { MODE_BRIDGE = 0, MODE_SCAN, MODE_CONSOLE, MODE_SNIFF };
 
 enum Severity : uint8_t { SEV_OK = 0, SEV_INFO, SEV_WARN, SEV_FAULT };
 
@@ -149,11 +149,56 @@ struct ScanStatus {
   ScanResult results[SCAN_MAX_RESULTS];
 };
 
+// ===================== Sniffer (listen-only) =====================
+#define SNIFF_LOG_SIZE 200
+#define SNIFF_MAX_BYTES 64
+#define SNIFF_DETECT_COMBOS 16
+
+enum SniffKind : uint8_t {
+  SK_REQUEST = 0,  // master -> slave
+  SK_RESPONSE,     // slave -> master, normal reply
+  SK_EXCEPTION,    // slave -> master, exception reply
+  SK_FRAME,        // valid CRC, direction unknown (no matching request seen)
+  SK_GARBAGE       // bytes that form no valid frame
+};
+
+enum SniffState : uint8_t { SNIFF_OFF = 0, SNIFF_DETECTING, SNIFF_RUNNING };
+
+struct SniffEntry {
+  uint64_t tUs;  // end of frame, microseconds since sniffing started
+  uint32_t seq;
+  uint16_t len;  // real length (bytes[] holds at most SNIFF_MAX_BYTES)
+  uint8_t kind;  // SniffKind
+  uint8_t bytes[SNIFF_MAX_BYTES];
+};
+
+struct SniffRequest {
+  bool autoDetect;
+  bool forwardUsb;
+  ScanCombo combo;  // used when autoDetect is false
+};
+
+struct SniffStatus {
+  uint8_t state;  // SniffState
+  uint8_t detectIdx;
+  uint8_t detectCycles;
+  bool autoDetected;
+  bool forwardUsb;
+  ScanCombo combo;  // current listening setting
+  uint32_t frames;
+  uint32_t garbage;
+  uint32_t bytes;
+  uint32_t droppedHostBytes;
+  uint32_t startedMs;
+  uint32_t lastSeq;
+  uint16_t detectScore[SNIFF_DETECT_COMBOS];
+};
+
 // ===================== Diagnosis (web side) =====================
 #define MAX_FINDINGS 24
 
 // Action button offered next to a finding's remedy on the web page.
-enum FindingAction : uint8_t { ACT_NONE = 0, ACT_SCAN, ACT_RESET, ACT_SETTINGS };
+enum FindingAction : uint8_t { ACT_NONE = 0, ACT_SCAN, ACT_RESET, ACT_SETTINGS, ACT_SNIFF };
 
 struct Finding {
   uint8_t sev;     // Severity

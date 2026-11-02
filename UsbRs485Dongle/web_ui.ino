@@ -525,12 +525,25 @@ void diagnoseExceptions(const String &sid, const SlaveStats &s) {
   }
 }
 
+// Settings the bus is being read at: the sniffer's while sniffing, else the PC's.
+String busSettingsText() {
+  if (bridgeMode == MODE_SNIFF) {
+    ScanCombo c;
+    portENTER_CRITICAL(&sniffMux);
+    c = sniffStatus.combo;
+    portEXIT_CRITICAL(&sniffMux);
+    LineCoding lc = { c.baud, 8, c.parity, c.stopBits };
+    return lineCodingText(lc);
+  }
+  return lineCodingText(activeCoding);
+}
+
 void runDiagnosis() {
   takeSnapshot();
   findingCount = 0;
   overallSev = SEV_OK;
 
-  String line = lineCodingText(activeCoding);
+  String line = busSettingsText();
   bool hostOpen = (bool)Serial;
   uint8_t mode = bridgeMode;
   uint8_t il = idleLevel;
@@ -543,6 +556,22 @@ void runDiagnosis() {
     addFinding(SEV_INFO, "USB console mode",
                "The PC opened the port at " + String(CONSOLE_BAUD) + " baud, so nothing is bridged.",
                "Close the serial terminal.\nOpen the COM port again at the bus baud rate in your Modbus master.");
+  } else if (mode == MODE_SNIFF) {
+    uint8_t sst;
+    portENTER_CRITICAL(&sniffMux);
+    sst = sniffStatus.state;
+    portEXIT_CRITICAL(&sniffMux);
+    if (sst == SNIFF_DETECTING) {
+      addFinding(SEV_INFO, "Sniffer: detecting bus settings",
+                 "Listening at each common baud rate and format until valid Modbus frames are seen (currently " + line + ").",
+                 "Make sure the other master is polling - detection needs traffic.\n"
+                 "If nothing is detected after a full pass, check the A/B wiring at the dongle, or start the sniffer with the settings chosen manually.", ACT_SNIFF);
+    } else {
+      addFinding(SEV_INFO, "Sniffer mode (listen-only) at " + line,
+                 "The dongle never transmits. The statistics and findings on this page describe the traffic of the master already on the bus.",
+                 "Open the Sniffer page to see the decoded frames.\n"
+                 "Stop the sniffer there to use the dongle as a USB converter again.", ACT_SNIFF);
+    }
   } else if (!hostOpen) {
     addFinding(SEV_INFO, "PC port not open",
                "No application has the COM port open.",
@@ -573,6 +602,13 @@ void runDiagnosis() {
   }
 
   uint32_t total = snapG.requests;
+  if (total == 0 && snapG.broadcasts == 0 && mode == MODE_SNIFF && snapG.rxBytes > 0) {
+    addFinding(SEV_WARN, "Sniffer: no master requests decoded",
+               "Bytes are arriving at " + line + ", but none of them form a valid Modbus RTU request.",
+               "The baud rate or parity is probably wrong: restart the sniffer with Auto-detect.\n"
+               "If the Sniffer page shows only GARBAGE rows at every setting, check A/B polarity at the dongle.\n"
+               "The bus may carry Modbus ASCII or another protocol, which this sniffer does not decode.", ACT_SNIFF);
+  }
   if (total == 0 && snapG.nonRtuRequests == 0 && snapG.broadcasts == 0 && mode == MODE_BRIDGE) {
     addFinding(SEV_INFO, "No Modbus traffic yet",
                "The PC hasn't sent any Modbus RTU request through the dongle since the statistics were reset.",
@@ -695,7 +731,7 @@ void runDiagnosis() {
   }
 
   // ---- bus-wide ----
-  if (snapG.foreignFrames > 0) {
+  if (snapG.foreignFrames > 0 && mode != MODE_SNIFF) {
     addFinding(SEV_WARN, "Another device is talking on the bus",
                String(snapG.foreignFrames) + " valid Modbus frame(s) appeared that were not replies to requests sent through this dongle - another master (PLC, HMI, gateway, meter reader) is polling the same bus.",
                "Find the other master: look at Recent transactions (FOREIGN rows) to see which IDs it polls.\n"
@@ -781,6 +817,7 @@ String modeText(uint8_t m) {
   switch (m) {
     case MODE_SCAN: return "Auto-scan";
     case MODE_CONSOLE: return "USB console";
+    case MODE_SNIFF: return "Sniffer (listen-only)";
     default: return "Bridging";
   }
 }
@@ -838,6 +875,7 @@ String navBar() {
   String html = "<h2>Modbus Dongle</h2>";
   html += "<button class='nav' type='button' onclick=\"location.href='/'\">Diagnostics</button>";
   html += "<button class='nav' type='button' onclick=\"location.href='/scan'\">Auto-scan</button>";
+  html += "<button class='nav' type='button' onclick=\"location.href='/sniff'\">Sniffer</button>";
   html += "<button class='nav' type='button' onclick=\"location.href='/settings'\">Settings</button>";
   html += "<button class='danger' type='button' onclick=\"location.href='/logout'\">Log Out</button>";
   if (webAuthUsingDefaults()) {
@@ -932,7 +970,7 @@ const char DASHBOARD_BODY[] PROGMEM = R"rawliteral(
 <script>
 const $=id=>document.getElementById(id);
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-const ACT={scan:['Open Auto-scan',"location.href='/scan'"],reset:['Reset statistics (after fixing)','resetStats()'],settings:['Open Settings',"location.href='/settings'"]};
+const ACT={sniff:['Open Sniffer',"location.href='/sniff'"],scan:['Open Auto-scan',"location.href='/scan'"],reset:['Reset statistics (after fixing)','resetStats()'],settings:['Open Settings',"location.href='/settings'"]};
 function kv(label,val){return '<div class="kv">'+esc(label)+'<b>'+esc(val)+'</b></div>';}
 function ago(s){if(s<0)return '-';if(s<60)return s+' s';if(s<3600)return Math.floor(s/60)+' min';return Math.floor(s/3600)+' h';}
 function render(d){
@@ -941,7 +979,7 @@ function render(d){
   $('findings').innerHTML=d.health.findings.map(f=>'<div class="f f-'+f.sev+'"><div class="t">['+f.sev+'] '+esc(f.title)+'</div><div class="d"><b>Likely cause:</b> '+esc(f.cause)+'</div>'+(f.remedy?'<div class="d"><b>'+(f.sev=='OK'?'Notes':'Remedy')+':</b><ol>'+f.remedy.split('\n').map(x=>'<li>'+esc(x)+'</li>').join('')+'</ol></div>':'')+(ACT[f.action]?'<button type="button" onclick="'+ACT[f.action][1]+'">'+ACT[f.action][0]+'</button>':'')+'</div>').join('');
   $('conn').textContent='Recommended master response timeout: '+d.recTimeoutMs+' ms';
   const L=d.link;
-  $('link').innerHTML=kv('PC port',L.usbOpen?'Open':'Closed')+kv('Port settings',L.line+(L.fromHost?' (from PC)':' (default)'))+kv('Mode',L.mode)+kv('Bus idle level',L.idle)+kv('Last bus activity',L.lastActivityS<0?'never':ago(L.lastActivityS)+' ago')+kv('Diag reply timeout',L.diagTimeoutMs+' ms')+kv('WiFi AP',d.dev.ap+' / '+d.dev.apIp)+kv('Site WiFi',d.dev.sta)+kv('Uptime',ago(d.uptimeS))+kv('Free heap',d.heap+' B');
+  $('link').innerHTML=kv('PC port',L.usbOpen?'Open':'Closed')+kv('Port settings',L.line+(L.mode.indexOf('Sniffer')==0?' (sniffer)':(L.fromHost?' (from PC)':' (default)')))+kv('Mode',L.mode)+kv('Bus idle level',L.idle)+kv('Last bus activity',L.lastActivityS<0?'never':ago(L.lastActivityS)+' ago')+kv('Diag reply timeout',L.diagTimeoutMs+' ms')+kv('WiFi AP',d.dev.ap+' / '+d.dev.apIp)+kv('Site WiFi',d.dev.sta)+kv('Uptime',ago(d.uptimeS))+kv('Free heap',d.heap+' B');
   const T=d.totals;
   $('since').textContent='(since '+ago(T.sinceS)+' ago)';
   $('totals').innerHTML=[['Requests',T.requests],['Replies OK',T.ok],['Timeouts',T.timeouts],['CRC / length errors',T.crc],['Exceptions',T.exceptions],['Wrong slave ID',T.wrongSlave],['Late replies',T.late],['Broadcasts',T.broadcasts],['Foreign frames',T.foreign],['Noise bytes',T.noise],['Stray lead bytes',T.glitch],['Non-RTU requests',T.nonRtu],['UART framing err',T.frameErr],['UART parity err',T.parityErr],['Break events',T.breaks],['Overflows (RS485/USB)',T.uartOvf+' / '+T.usbOvf],['Bytes PC to bus',T.txBytes],['Bytes bus to PC',T.rxBytes]].map(x=>kv(x[0],x[1])).join('');
@@ -995,7 +1033,7 @@ void handleApiDiag() {
 
   int32_t lastAct = snapG.lastActivityMs ? (int32_t)((nowMs - snapG.lastActivityMs) / 1000) : -1;
   j += ",\"link\":{\"usbOpen\":" + String((bool)Serial ? "true" : "false");
-  j += ",\"line\":\"" + lineCodingText(activeCoding) + "\",\"fromHost\":" + String(lineCodingFromHost ? "true" : "false");
+  j += ",\"line\":\"" + busSettingsText() + "\",\"fromHost\":" + String((lineCodingFromHost && bridgeMode != MODE_SNIFF) ? "true" : "false");
   j += ",\"mode\":\"" + modeText(bridgeMode) + "\",\"idle\":\"" + idleLevelText(idleLevel) + "\"";
   j += ",\"lastActivityS\":" + String(lastAct) + ",\"diagTimeoutMs\":" + String(diagResponseTimeoutMs) + "}";
 
@@ -1010,9 +1048,9 @@ void handleApiDiag() {
       if (!first) j += ",";
       first = false;
       // Firmware-authored text; the page escapes it before display.
-      static const char *actions[] = { "", "scan", "reset", "settings" };
+      static const char *actions[] = { "", "scan", "reset", "settings", "sniff" };
       j += "{\"sev\":\"" + String(sevName(sev)) + "\",\"title\":\"" + jsonEscape(findings[i].title) + "\",\"cause\":\"" + jsonEscape(findings[i].cause);
-      j += "\",\"remedy\":\"" + jsonEscape(findings[i].remedy) + "\",\"action\":\"" + String(actions[findings[i].action < 4 ? findings[i].action : 0]) + "\"}";
+      j += "\",\"remedy\":\"" + jsonEscape(findings[i].remedy) + "\",\"action\":\"" + String(actions[findings[i].action < 5 ? findings[i].action : 0]) + "\"}";
     }
   }
   j += "]},\"recTimeoutMs\":" + String(recommendedTimeoutMs);
@@ -1197,6 +1235,7 @@ void handleApiScanStart() {
 
   if (bridgeMode == MODE_SCAN || scanStartPending) return sendScanError("A scan is already running.");
   if (bridgeMode == MODE_CONSOLE) return sendScanError("The PC has the port open in console mode (74880 baud).");
+  if (bridgeMode == MODE_SNIFF || sniffStartPending) return sendScanError("The sniffer is running - stop it on the Sniffer page first (auto-scan transmits on the bus).");
 
   long idFrom = server.arg("idFrom").toInt();
   long idTo = server.arg("idTo").toInt();
@@ -1290,6 +1329,220 @@ void handleApiScan() {
     if (!first) j += ",";
     first = false;
     j += "\"" + String(req.combos[c].baud) + " " + comboText(req.combos[c]) + "\"";
+  }
+  j += "]}";
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", j);
+}
+
+// ===================== Sniffer page =====================
+const char SNIFF_BODY[] PROGMEM = R"rawliteral(
+<div class="box"><h3>Sniffer: listen to another master's bus</h3>
+<p class="note">Listen-only: the dongle never transmits while sniffing (its RS485 driver stays off), so it can be connected to a working bus without disturbing it. Frames are decoded live below, and the <b>Diagnostics</b> page analyses the traffic (timeouts, exceptions, latency per slave) with the same remedies as for the dongle's own traffic. Data sent by the PC is discarded while sniffing.</p>
+<table style="width:auto"><tr><td class="l">Bus settings</td><td class="l"><select id="combo"></select></td></tr>
+<tr><td class="l">Copy to PC</td><td class="l"><label><input type="checkbox" id="fwd" checked> Copy the raw bus traffic to the dongle's COM port (for PC capture tools)</label></td></tr>
+<tr><td class="l">Statistics</td><td class="l"><label><input type="checkbox" id="rst" checked> Reset statistics when starting</label></td></tr></table>
+<button type="button" id="startBtn" onclick="start()">Start sniffing</button>
+<button type="button" class="danger" id="stopBtn" onclick="stop()" disabled>Stop</button>
+<div id="msg"></div><p id="status" class="note"></p></div>
+
+<div class="box"><h3>Frames</h3>
+<p>Slave ID filter <input type="number" id="flt" min="0" max="247" placeholder="all" style="width:70px">
+<label><input type="checkbox" id="pause"> Pause view</label>
+<button type="button" onclick="clearView()">Clear view</button>
+<button type="button" onclick="csv()">Download CSV</button> <span class="note" id="kept"></span></p>
+<table><thead><tr><th>#</th><th>Time (s)</th><th>Gap (ms)</th><th>Direction</th><th>ID</th><th>Function</th><th>Details</th><th>Raw bytes</th></tr></thead><tbody id="rows"></tbody></table></div>
+
+<script>
+const $=id=>document.getElementById(id);
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+const BAUDS=[9600,19200,38400,115200,57600,4800,2400,1200], FMTS=[['N1','8N1'],['E1','8E1'],['O1','8O1'],['N2','8N2']];
+$('combo').innerHTML='<option value="auto">Auto-detect (listen at each common setting)</option>'+BAUDS.map(b=>FMTS.map(f=>'<option value="'+b+','+f[0]+'">'+b+' '+f[1]+'</option>').join('')).join('');
+const FC={1:'Read Coils',2:'Read Discrete Inputs',3:'Read Holding Registers',4:'Read Input Registers',5:'Write Single Coil',6:'Write Single Register',7:'Read Exception Status',8:'Diagnostics',11:'Get Comm Event Counter',15:'Write Multiple Coils',16:'Write Multiple Registers',17:'Report Server ID',22:'Mask Write Register',23:'Read/Write Multiple Registers',43:'Encapsulated Interface'};
+const EXC={1:'Illegal Function',2:'Illegal Data Address',3:'Illegal Data Value',4:'Slave Device Failure',5:'Acknowledge',6:'Slave Device Busy',8:'Memory Parity Error',10:'Gateway Path Unavailable',11:'Gateway Target No Response'};
+const KIND=['REQUEST','RESPONSE','EXCEPTION','FRAME','GARBAGE'];
+let since=0, frames=[], lastReq={}, prevT=null, running=false;
+const MAXKEEP=20000, MAXROWS=500;
+function w(b,i){return (b[i]<<8)|b[i+1];}
+function decode(f){
+  const b=f.b, k=KIND[f.k];
+  if(k=='GARBAGE') return {dir:'?',id:'',fn:'',det:f.n+' byte(s) with no valid frame (noise, collision or wrong settings)'};
+  const id=b[0], fc=b[1]&0x7f, name=FC[fc]||('FC '+fc);
+  if(k=='EXCEPTION') return {dir:'SLAVE',id:id,fn:name,det:'Exception '+b[2]+' '+(EXC[b[2]]||'')};
+  if(k=='REQUEST'){
+    lastReq[id]={fc:fc,addr:w(b,2),qty:w(b,4)};
+    let d='';
+    if(fc>=1&&fc<=4) d='address '+w(b,2)+', quantity '+w(b,4);
+    else if(fc==5) d='coil '+w(b,2)+' = '+(b[4]==0xff?'ON':'OFF');
+    else if(fc==6) d='register '+w(b,2)+' = '+w(b,4);
+    else if(fc==15) d=w(b,4)+' coil(s) from '+w(b,2);
+    else if(fc==16){const n=w(b,4),v=[];for(let i=0;i<n&&i<10&&7+2*i+1<f.n-2;i++)v.push(w(b,7+2*i));d=n+' register(s) from '+w(b,2)+': '+v.join(', ')+(n>10?' ...':'');}
+    return {dir:'MASTER',id:id,fn:name,det:d};
+  }
+  if(k=='RESPONSE'){
+    const r=lastReq[id]; let d='';
+    if((fc==3||fc==4)&&b[2]){const n=b[2]/2,v=[];for(let i=0;i<n&&i<12;i++)v.push((r&&r.fc==fc?'['+(r.addr+i)+']=':'')+w(b,3+2*i));d=v.join(' ')+(n>12?' ...':'');}
+    else if(fc==1||fc==2){const bits=[];for(let i=0;i<b[2]*8&&i<32;i++)bits.push((b[3+(i>>3)]>>(i&7))&1);if(r)bits.length=Math.min(bits.length,r.qty);d=(r?'from '+r.addr+': ':'')+bits.join('');}
+    else if(fc==5||fc==6||fc==15||fc==16) d='OK (write confirmed)';
+    return {dir:'SLAVE',id:id,fn:name,det:d};
+  }
+  return {dir:'?',id:id,fn:name,det:'valid frame, no matching request seen'};
+}
+function hex(f){return f.b.map(x=>x.toString(16).padStart(2,'0').toUpperCase()).join(' ')+(f.n>f.b.length?' ... ('+f.n+' bytes)':'');}
+function rowHtml(f){
+  const flt=$('flt').value;
+  if(flt!==''&&String(f.d.id)!==flt) return '';
+  const cls=f.k==4?'r-CRCLENGTH':(f.k==2?'r-EXCEPTION':(f.k==1?'r-OK':''));
+  return '<tr><td>'+f.s+'</td><td>'+(f.t/1e6).toFixed(4)+'</td><td>'+(f.g==null?'':f.g.toFixed(1))+'</td><td class="'+cls+'">'+f.d.dir+'</td><td>'+f.d.id+'</td><td>'+esc(f.d.fn)+'</td><td class="l">'+esc(f.d.det)+'</td><td class="mono">'+hex(f)+'</td></tr>';
+}
+function redraw(){
+  if($('pause').checked) return;
+  const out=[];for(let i=frames.length-1;i>=0&&out.length<MAXROWS;i--){const r=rowHtml(frames[i]);if(r)out.push(r);}
+  $('rows').innerHTML=out.join('')||'<tr><td colspan="8">No frames yet</td></tr>';
+  $('kept').textContent=frames.length+' frame(s) kept for CSV (max '+MAXKEEP+')';
+}
+function clearView(){frames=[];lastReq={};prevT=null;redraw();}
+function csv(){
+  const L=['seq,time_s,gap_ms,direction,slave_id,function,details,raw_hex'];
+  frames.forEach(f=>L.push([f.s,(f.t/1e6).toFixed(6),f.g==null?'':f.g.toFixed(3),f.d.dir,f.d.id,'"'+f.d.fn+'"','"'+String(f.d.det).replace(/"/g,"'")+'"',hex(f)].join(',')));
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([L.join('\n')],{type:'text/csv'}));a.download='modbus_sniff.csv';a.click();
+}
+async function post(url,body){
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body||''});
+  if(r.status==401){location.href='/login';throw 0;}
+  return r.json();
+}
+async function start(){
+  const v=$('combo').value, p=new URLSearchParams({fwd:$('fwd').checked?1:0,reset:$('rst').checked?1:0});
+  if(v=='auto') p.set('auto','1'); else {const x=v.split(',');p.set('baud',x[0]);p.set('fmt',x[1]);}
+  const d=await post('/api/sniff/start',p.toString());
+  $('msg').innerHTML=d.ok?'':'<div class="err">'+esc(d.error)+'</div>';
+  if(d.ok) clearView();
+}
+async function stop(){await post('/api/sniff/stop');}
+async function poll(){
+  try{
+    const r=await fetch('/api/sniff?since='+since,{cache:'no-store'});
+    if(r.status==401){location.href='/login';return;}
+    const d=await r.json();
+    running=d.state!='OFF';
+    $('startBtn').disabled=running;$('stopBtn').disabled=!running;
+    let st;
+    if(d.state=='OFF') st='Stopped.'+(d.frames?' Last session: '+d.frames+' frame(s), '+d.garbage+' garbage.':'');
+    else if(d.state=='DETECTING') st='Auto-detecting bus settings: listening at '+d.combo+' ('+(d.detectIdx+1)+'/'+d.detectTotal+(d.cycles?', pass '+(d.cycles+1):'')+'). Make sure the master is polling.';
+    else st='Sniffing at '+d.combo+(d.auto?' (auto-detected)':'')+' - '+d.frames+' frame(s), '+d.garbage+' garbage, '+d.bytes+' byte(s)'+(d.fwd?', copied to the PC':'')+'. Running '+d.elapsedS+' s.';
+    if(d.dropped) st+=' '+d.dropped+' byte(s) from the PC discarded (the dongle does not transmit while sniffing).';
+    if(d.missed) st+=' '+d.missed+' frame(s) were not fetched in time (view was too slow).';
+    $('status').textContent=st;
+    for(const f of d.list){
+      f.d=decode(f); f.g=prevT==null?null:(f.t-prevT)/1000; prevT=f.t; frames.push(f);
+    }
+    if(frames.length>MAXKEEP) frames.splice(0,frames.length-MAXKEEP);
+    if(d.list.length) since=d.list[d.list.length-1].s; else since=Math.max(since,d.seq);
+    if(d.list.length||!frames.length) redraw();
+    setTimeout(poll,d.more?50:500);
+  }catch(e){setTimeout(poll,2000);}
+}
+$('flt').addEventListener('input',redraw);$('pause').addEventListener('change',redraw);
+poll();
+</script>
+</body></html>
+)rawliteral";
+
+void handleSniffPage() {
+  if (!requireAuth()) return;
+  String html = pageHead("Sniffer");
+  html += navBar();
+  html += FPSTR(SNIFF_BODY);
+  server.send(200, "text/html", html);
+}
+
+void handleApiSniffStart() {
+  if (!requireAuthApi()) return;
+  if (bridgeMode == MODE_SNIFF || sniffStartPending) return sendScanError("The sniffer is already running.");
+  if (bridgeMode == MODE_SCAN || scanStartPending) return sendScanError("An auto-scan is running - wait for it or stop it first.");
+
+  SniffRequest req;
+  memset(&req, 0, sizeof(req));
+  req.autoDetect = server.arg("auto") == "1";
+  req.forwardUsb = server.arg("fwd") == "1";
+  if (!req.autoDetect) {
+    long baud = server.arg("baud").toInt();
+    String fmt = server.arg("fmt");
+    if (baud < MIN_BAUD || baud > MAX_BAUD) return sendScanError("Choose a baud rate or Auto-detect.");
+    req.combo.baud = baud;
+    if (fmt == "N1") { req.combo.parity = 0; req.combo.stopBits = 0; }
+    else if (fmt == "E1") { req.combo.parity = 2; req.combo.stopBits = 0; }
+    else if (fmt == "O1") { req.combo.parity = 1; req.combo.stopBits = 0; }
+    else if (fmt == "N2") { req.combo.parity = 0; req.combo.stopBits = 2; }
+    else return sendScanError("Unknown format.");
+  }
+  if (server.arg("reset") == "1") resetStatistics();
+
+  portENTER_CRITICAL(&sniffMux);
+  sniffRequest = req;
+  portEXIT_CRITICAL(&sniffMux);
+  sniffStartPending = true;
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiSniffStop() {
+  if (!requireAuthApi()) return;
+  if (bridgeMode == MODE_SNIFF) sniffStopPending = true;
+  sniffStartPending = false;
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+#define SNIFF_API_MAX 100
+SniffEntry sniffOut[SNIFF_API_MAX];  // webTask-only copy buffer
+
+void handleApiSniff() {
+  if (!requireAuthApi()) return;
+
+  uint32_t since = (uint32_t)server.arg("since").toInt();
+  SniffStatus st;
+  uint32_t n = 0, missed = 0;
+  bool more = false;
+
+  portENTER_CRITICAL(&sniffMux);
+  st = sniffStatus;
+  uint32_t oldest = (st.lastSeq > SNIFF_LOG_SIZE) ? st.lastSeq - SNIFF_LOG_SIZE + 1 : 1;
+  uint32_t first = since + 1;
+  if (first < oldest) {
+    if (since > 0) missed = oldest - first;
+    first = oldest;
+  }
+  for (uint32_t q = first; q <= st.lastSeq && n < SNIFF_API_MAX; q++) {
+    sniffOut[n++] = sniffLog[q % SNIFF_LOG_SIZE];
+  }
+  more = (first + n <= st.lastSeq);
+  portEXIT_CRITICAL(&sniffMux);
+
+  const char *states[] = { "OFF", "DETECTING", "RUNNING" };
+  LineCoding lc = { st.combo.baud, 8, st.combo.parity, st.combo.stopBits };
+  uint8_t state = st.state;
+  if (sniffStartPending && state == SNIFF_OFF) state = SNIFF_DETECTING;
+
+  String j;
+  j.reserve(4096 + n * 120);
+  j += "{\"state\":\"" + String(states[state < 3 ? state : 0]) + "\",\"combo\":\"" + (st.combo.baud ? lineCodingText(lc) : String("-")) + "\"";
+  j += ",\"auto\":" + String(st.autoDetected ? "true" : "false") + ",\"fwd\":" + String(st.forwardUsb ? "true" : "false");
+  j += ",\"detectIdx\":" + String(st.detectIdx) + ",\"detectTotal\":" + String(SNIFF_DETECT_COMBOS) + ",\"cycles\":" + String(st.detectCycles);
+  j += ",\"frames\":" + String(st.frames) + ",\"garbage\":" + String(st.garbage) + ",\"bytes\":" + String(st.bytes);
+  j += ",\"dropped\":" + String(st.droppedHostBytes) + ",\"missed\":" + String(missed) + ",\"seq\":" + String(st.lastSeq);
+  j += ",\"elapsedS\":" + String(st.startedMs ? (millis() - st.startedMs) / 1000 : 0) + ",\"more\":" + String(more ? "true" : "false");
+  j += ",\"list\":[";
+  for (uint32_t i = 0; i < n; i++) {
+    const SniffEntry &e = sniffOut[i];
+    if (i) j += ",";
+    j += "{\"s\":" + String(e.seq) + ",\"t\":" + String((unsigned long long)e.tUs) + ",\"k\":" + String(e.kind) + ",\"n\":" + String(e.len) + ",\"b\":[";
+    uint16_t m = min((int)e.len, SNIFF_MAX_BYTES);
+    for (uint16_t b = 0; b < m; b++) {
+      if (b) j += ",";
+      j += String(e.bytes[b]);
+    }
+    j += "]}";
   }
   j += "]}";
 
@@ -1566,6 +1819,10 @@ void setupWeb() {
   server.on("/api/scan", HTTP_GET, handleApiScan);
   server.on("/api/scan/start", HTTP_POST, handleApiScanStart);
   server.on("/api/scan/stop", HTTP_POST, handleApiScanStop);
+  server.on("/sniff", HTTP_GET, handleSniffPage);
+  server.on("/api/sniff", HTTP_GET, handleApiSniff);
+  server.on("/api/sniff/start", HTTP_POST, handleApiSniffStart);
+  server.on("/api/sniff/stop", HTTP_POST, handleApiSniffStop);
   server.on("/saveDiag", HTTP_POST, handleSaveDiag);
   server.on("/saveWifi", HTTP_POST, handleSaveWifi);
   server.on("/saveDevice", HTTP_POST, handleSaveDevice);

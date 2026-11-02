@@ -10,7 +10,8 @@ through it to the RS485 bus.
 
 Unlike a plain dongle, it also **watches every transaction it carries and
 explains what is wrong with the bus** on a WiFi web page. It can also
-**auto-scan** for devices whose baud rate, parity or slave ID you don't know.
+**auto-scan** for devices whose baud rate, parity or slave ID you don't know,
+and **sniff** (listen only) a bus that another master is already running.
 
 The hardware doesn't change. The firmware uses the same pins and the same
 RS485 handling as the Gateway firmware.
@@ -91,6 +92,7 @@ The diagnostics page checks the same thing from the receiver side. *Bus idle lev
   | Red blink every 2 s | Diagnosis verdict FAULT |
   | Yellow blink every 2 s | Diagnosis verdict WARN |
   | Purple blink every 1 s | Auto-scan running |
+  | Cyan blink every 1 s | Sniffer running (green flash per received frame) |
   | Red flash | USB RX overflow, or mark/space parity requested (falls back to none) |
 
 ## Diagnostics (WiFi page)
@@ -257,6 +259,51 @@ settings.
 - A device that ignores FC03 completely, without even an exception reply, needs
   the FC04 probe.
 
+### 4. Sniffer (listen-only)
+Sniffer mode connects the dongle to a bus that **another master** is already
+running: a PLC, HMI, SCADA gateway or meter reader. It shows what is happening
+without disturbing it.
+
+![Sniffer page decoding master requests and slave replies](docs/images/sniffer.png)
+
+- **Never transmits.** The RS485 driver (DE/RE) stays off for the whole
+  session, so the dongle is only an extra receiver on the bus. Data the PC
+  sends is discarded (and counted).
+- **Bus settings:** choose the baud rate and format, or pick **Auto-detect**.
+  Auto-detect listens at each of 16 common settings for up to 2 s each, most
+  common first, and locks onto the first one that shows 3 well-formed Modbus
+  frames. After a full pass with fewer, it takes the best setting with at
+  least 2. Detection needs traffic, so the master must be polling. To avoid
+  locking onto noise, frames only count if they have the exact shape of a
+  request or a reply, not just a valid CRC.
+- **Frame decoding:** bytes are split into Modbus RTU frames by CRC and timing,
+  even when a request and its reply arrive back to back. Each frame is then
+  classified:
+
+  | Direction | Meaning |
+  |---|---|
+  | MASTER | A request, decoded: function, address and quantity, or the values written |
+  | SLAVE | The reply to the last request to that ID. Register values are shown with their addresses, coils as bits, writes as *OK (write confirmed)* |
+  | SLAVE (yellow) | An exception reply, with its code and name |
+  | ? | Bytes that form no valid frame: noise, a collision or wrong settings. Also valid frames with no matching request |
+
+- **Live view:** frame number, time, the gap to the previous frame in ms,
+  direction, slave ID, function, decoded details and raw hex. You can filter by
+  slave ID and pause the view. **Download CSV** saves up to 20,000 frames for a
+  report.
+- **Passive diagnosis:** the frames feed the same analyzer as normal bridging.
+  While sniffing, the **Diagnostics** page shows per-slave success rate,
+  timeouts, exceptions and latency for the other master's traffic, with the
+  same findings and remedies. For example, *Slave 7 never answers* or
+  *exception 02* on a PLC's poll list. If the master retries before a slave
+  replies, the first attempt is counted as a timeout.
+- **Copy to PC (optional, on by default):** the raw bus bytes are also sent to
+  the dongle's COM port, so PC tools (a serial capture program, or a sniffer
+  that reads a COM port) can record the same traffic.
+- **Mutually exclusive with Auto-scan:** auto-scan transmits, so it's refused
+  while sniffing, and the other way round. Stopping the sniffer switches back
+  to normal USB bridging with the PC's port settings.
+
 ## Web access, login and recovery (Gateway conventions)
 
 | Item | Default |
@@ -343,7 +390,8 @@ diagnosis.
 
 `tests/host/run.sh` checks the firmware on a PC, with no board needed. It
 compiles the sketch against minimal Arduino/ESP32 stand-ins and runs tests of
-the transaction analyzer and diagnosis engine on simulated traffic:
+the transaction analyzer, the diagnosis engine and the sniffer (frame splitting,
+request/response pairing, auto-detect against random noise) on simulated traffic:
 
 ```sh
 sh tests/host/run.sh    # needs g++ and python3

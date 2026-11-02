@@ -56,5 +56,51 @@ int main(){
   // 14) dead after working
   for(int i=0;i<6;i++){ sendReq({1,3,0,0,0,1}); idle(1100);} runDiagnosis(); bool down=false;
   for(int i=0;i<findingCount;i++) if(findings[i].title=="Slave 1 stopped responding") down=true; CHECK(down);
+  // ===== 15) Sniffer: splitting, pairing, passive diagnosis =====
+  {
+    resetStatistics(); analyzerAbort();
+    bridgeMode = MODE_SNIFF; memset(&sniffStatus,0,sizeof(sniffStatus)); sniffStatus.state = SNIFF_RUNNING;
+    sniffClockUs = 0; sniffLastMicros = micros();
+    auto seg = [&](std::vector<std::vector<uint8_t>> parts, bool crc=true){
+      segLen=0; for(auto& v: parts){ uint8_t b[300]; uint16_t n; if(crc) frame(v,b,n); else {memcpy(b,v.data(),v.size()); n=v.size();}
+        memcpy(segBuf+segLen,b,n); segLen+=n; }
+      g_us += 20000; segLastUs = micros(); splitSegment(false); };
+    auto lastKind=[&](int back){ return sniffLog[(sniffStatus.lastSeq-back)%SNIFF_LOG_SIZE].kind; };
+    // request + response arriving in ONE segment (fast slave / high baud)
+    seg({{5,3,0,10,0,2},{5,3,4,0,1,0,2}});
+    CHECK(sniffStatus.frames==2); CHECK(lastKind(1)==SK_REQUEST); CHECK(lastKind(0)==SK_RESPONSE); CHECK(slaveStats[5].ok==1);
+    // separate segments + exception
+    seg({{5,3,0x9C,0x40,0,1}}); seg({{5,0x83,2}});
+    CHECK(lastKind(0)==SK_EXCEPTION); CHECK(slaveStats[5].exceptions==1);
+    // FC6 write + echo reply (same shape as the request)
+    seg({{5,6,0,1,0,7}}); seg({{5,6,0,1,0,7}});
+    CHECK(lastKind(1)==SK_REQUEST); CHECK(lastKind(0)==SK_RESPONSE); CHECK(slaveStats[5].ok==2);
+    // master retries before the reply: second identical request is a request, first counts as timeout
+    seg({{9,4,0,0,0,1}}); seg({{9,4,0,0,0,1}}); seg({{9,4,2,0,5}});
+    CHECK(slaveStats[9].timeouts==1); CHECK(slaveStats[9].ok==1);
+    // stray 0x00 before a reply inside one segment
+    { seg({{5,3,0,0,0,1}}); uint8_t b[16]; uint16_t n; frame({5,3,2,0,9},b+1,n); b[0]=0; memcpy(segBuf,b,n+1); segLen=n+1; g_us+=20000; segLastUs=micros(); splitSegment(false);
+      CHECK(lastKind(0)==SK_RESPONSE); CHECK(lastKind(1)==SK_GARBAGE); CHECK(slaveStats[5].ok==3); }
+    // pure garbage
+    uint32_t g0=sniffStatus.garbage; seg({{0xFF,0x13,0x37,0x55,0xAA}},false); CHECK(sniffStatus.garbage==g0+1);
+    // FC16 write multiple + reply
+    seg({{5,16,0,0,0,2,4,0,1,0,2}}); seg({{5,16,0,0,0,2}}); CHECK(lastKind(1)==SK_REQUEST); CHECK(lastKind(0)==SK_RESPONSE);
+    printf("  sniffer: %u frames, %u garbage, slave5 ok=%u exc=%u\n", sniffStatus.frames, sniffStatus.garbage, slaveStats[5].ok, slaveStats[5].exceptions);
+    // passive diagnosis: sniffer finding present, no "Another device" finding
+    runDiagnosis(); bool sn=false, foreign=false;
+    for(int i=0;i<findingCount;i++){ if(findings[i].title.s.find("Sniffer mode")!=std::string::npos) sn=true; if(findings[i].title.s.find("Another device")!=std::string::npos) foreign=true; }
+    CHECK(sn); CHECK(!foreign);
+  }
+  // ===== 16) Auto-detect must not lock on noise =====
+  {
+    unsigned seed=12345; auto rnd=[&](){ seed=seed*1103515245u+12345u; return (seed>>16)&0xFF; };
+    detectScoreCur=0; int segs=5000;
+    for(int k=0;k<segs;k++){ segLen=8+rnd()%40; for(int i=0;i<segLen;i++) segBuf[i]=rnd(); segLastUs=micros(); splitSegment(true); }
+    printf("  auto-detect: %u plausible frame(s) found in %d random noise segments (lock needs 3 within 2 s)\n", detectScoreCur, segs);
+    CHECK(detectScoreCur <= 2);
+    detectScoreCur=0; uint8_t b[16]; uint16_t n; frame({1,3,0,0,0,1},b,n); memcpy(segBuf,b,n); segLen=n; segLastUs=micros(); splitSegment(true);
+    CHECK(detectScoreCur==1);
+    bridgeMode = MODE_BRIDGE;
+  }
   printf(fails? "%d FAILED\n" : "ALL PASSED\n", fails); return fails;
 }

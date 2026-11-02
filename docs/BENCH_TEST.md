@@ -1,6 +1,6 @@
 # Bench Test Procedure: USB ⇄ RS485 Dongle (Arduino Nano ESP32)
 
-This procedure checks the `UsbRs485Dongle` firmware (v1.1: converter + WiFi diagnostics + auto-scan) on the Gateway board hardware
+This procedure checks the `UsbRs485Dongle` firmware (v1.2: converter + WiFi diagnostics + auto-scan + sniffer) on the Gateway board hardware
 before it's used in the field. Run the tests in order, because later tests assume
 the earlier ones passed. Record the results in the table in §9.
 
@@ -250,7 +250,29 @@ Stop the Modbus master software before each scan (closing the COM port is enough
 
 ---
 
-## 11. LED behaviour
+## 11. Sniffer tests
+
+You need a second master that polls the slave: another USB-RS485 adapter
+running Modbus Poll or QModMaster, or a PLC. Connect the dongle to the same A/B
+pair. **The dongle's own COM port doesn't need to be open.**
+
+| Test | Steps | Pass criterion |
+|---|---|---|
+| **SN1 Listen-only** | Start the second master polling (FC03, 1 s interval). On the dongle open **Sniffer**, choose the bus settings manually and press **Start sniffing**. Watch the second master's error counter for 2 min | The second master shows **no new errors** while the dongle sniffs. The LED blinks cyan |
+| **SN2 Decoding** | As SN1 | MASTER and SLAVE rows alternate for each poll. Details show the address and quantity, and the reply values with their addresses, matching what the second master displays. Gap values match the poll interval |
+| **SN3 Never transmits** | As SN1, with a logic analyser or scope on **D4 (DE/RE)**. Also send data from the PC to the dongle's COM port | D4 stays **LOW** for the whole session. The status line counts the PC bytes as discarded. Nothing from the PC appears on the bus |
+| **SN4 Auto-detect** | Set the slave and second master to 19200 8E1. Start the sniffer with **Auto-detect** | The status changes from *Auto-detecting...* to **Sniffing at 19200 8E1 (auto-detected)** within about 10 s |
+| **SN5 Auto-detect without traffic** | Stop the second master, start Auto-detect, wait 40 s | It keeps cycling (*pass 2, 3...*) and doesn't lock onto a setting. Start the master: it locks within one pass |
+| **SN6 Exceptions and writes** | From the second master, read a register that doesn't exist, then write a register (FC06) and several registers (FC16) | The exception row is yellow with *Exception 2 Illegal Data Address*. Write requests show the values. Replies show *OK (write confirmed)* |
+| **SN7 Passive diagnosis** | As SN1, add a poll to a slave ID that doesn't exist. Open **Diagnostics** | *Sniffer mode (listen-only)* is shown, and **Slave N never answers** with its remedy. The working slave shows a 100 % success rate and its latency |
+| **SN8 Copy to PC** | Tick *Copy the raw bus traffic*, open the dongle's COM port in a serial terminal (hex view) at any baud rate | The terminal shows the raw request and reply bytes |
+| **SN9 CSV** | After 1 min of SN1 press **Download CSV** | The file opens in a spreadsheet with one row per frame (seq, time, gap, direction, ID, function, details, raw hex) |
+| **SN10 Stop and return** | Press **Stop**, stop the second master, then run F1 through the dongle | F1 passes: the dongle bridges normally again with the PC's port settings |
+| **SN11 Exclusive with scan** | While sniffing, try to start Auto-scan | Refused with *The sniffer is running - stop it on the Sniffer page first* |
+
+---
+
+## 12. LED behaviour
 
 | Test | Condition | Expected LED |
 |---|---|---|
@@ -261,10 +283,11 @@ Stop the Modbus master software before each scan (closing the COM port is enough
 | **E5** | Diagnosis verdict FAULT (e.g. D2), bus quiet | Red blink every 2 s |
 | **E6** | Diagnosis verdict WARN (e.g. D7), bus quiet | Yellow blink every 2 s |
 | **E7** | Auto-scan running | Purple blink every 1 s, plus blue/green flashes per probe |
+| **E8** | Sniffer running | Cyan blink every 1 s, plus a green flash per received frame. Never blue (no transmit) |
 
 ---
 
-## 12. Results record
+## 13. Results record
 
 | Test | Result (Pass / Fail / N/A) | Notes / measured values |
 |---|---|---|
@@ -301,13 +324,14 @@ Stop the Modbus master software before each scan (closing the COM port is enough
 | W1–W13 Web / login | | Failed: |
 | D1–D13 Diagnosis | | Failed: |
 | S1–S9 Auto-scan | | Failed: |
-| E1–E7 LEDs | | |
+| SN1–SN11 Sniffer | | Failed: |
+| E1–E8 LEDs | | |
 
 **Overall verdict:** ☐ PASS  ☐ FAIL. Signed: __________  Date: __________
 
 ---
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
@@ -318,6 +342,8 @@ Stop the Modbus master software before each scan (closing the COM port is enough
 | Fails only at high baud | Cable length, or the sensor-end 120 Ω termination missing (check P4b), or the transceiver's rated speed (MAX485 ≈ 2.5 Mbps max, some clones much lower) |
 | CRC errors that come and go under load (R1/R2) | Sensor-end termination (P4b) or biasing missing, ground loop, or noisy cable. Retest with a short bench cable |
 | Idle level LOW or UNSTABLE on the page | Measure A-B at idle: it should be +0.3 to +0.8 V with the 330 Ω bias. Negative means A/B swapped; near 0 V means the bias is missing or unpowered |
+| Sniffer shows only `?` garbage rows | Wrong baud rate or parity: restart with Auto-detect. If it never locks, check A/B polarity at the dongle and that the master is really polling |
+| Sniffer shows MASTER rows but no SLAVE rows | The slaves aren't answering the other master. Check *Diagnostics* for the per-slave findings and remedies |
 | Web page doesn't open | Check you are connected to the **ModbusDongle** WiFi and browsing to `http://192.168.4.1` (not https). Mobile phones may drop a WiFi network that has no internet access: turn off mobile data or tell the phone to stay connected |
 | Forgot the web or AP password | Open the COM port at **74880** baud and send `factory-reset-auth` (W12) |
 | Findings from an earlier fault still shown | Counters are cumulative: press **Reset statistics** after fixing a fault |

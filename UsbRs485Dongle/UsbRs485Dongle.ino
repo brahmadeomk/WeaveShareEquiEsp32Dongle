@@ -51,6 +51,11 @@
      serial command is reached through a "console" baud rate: open the COM
      port at CONSOLE_BAUD (74880) and send factory-reset-auth. In console
      mode nothing is bridged.
+   - Sniffer (listen-only) mode, started from the web page: DE/RE stays LOW
+     and nothing is ever transmitted. Bus frames are split by CRC/timing,
+     paired into request/response, logged for a live decoded view, and fed
+     to the same analyzer, so the diagnosis covers another master's bus.
+     Bus settings are chosen manually or auto-detected by listening.
 
    BUILD (Arduino IDE / arduino-cli)
      Board : "Arduino Nano ESP32" (arduino:esp32:nano_nora)
@@ -74,7 +79,7 @@
 #error "Select the Arduino Nano ESP32 with its default USB mode (TinyUSB CDC on boot). Hardware-CDC/debug mode cannot follow the host's baud/parity."
 #endif
 
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.2.0"
 
 // ===================== Pins (same as Gateway board) =====================
 #define RXD2 D2
@@ -186,6 +191,7 @@ portMUX_TYPE lineCodingMux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE statsMux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE scanMux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE keyLogMux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE sniffMux = portMUX_INITIALIZER_UNLOCKED;
 
 volatile bool lineCodingPending = false;
 LineCoding pendingCoding;  // guarded by lineCodingMux
@@ -292,7 +298,9 @@ void ledUpdate() {
 
   if (want == 0) {
     if (bridgeMode == MODE_SCAN) {
-      if ((now % 1000) < 150) want = 1 | 4;
+      if ((now % 1000) < 150) want = 1 | 4;  // purple
+    } else if (bridgeMode == MODE_SNIFF) {
+      if ((now % 1000) < 150) want = 2 | 4;  // cyan
     } else if ((now % 2000) < 120) {
       if (healthLevel == SEV_FAULT) want = 1;
       else if (healthLevel == SEV_WARN) want = 1 | 2;
@@ -1030,11 +1038,371 @@ void scanStep() {
   scanUpdateStatus(SCAN_RUNNING);
 }
 
+// ===================== Sniffer (listen-only, bridgeTask owns the bus) =====================
+// The transmitter is never enabled in this mode: DE/RE stays LOW the whole
+// time. Bytes on the bus are split into Modbus RTU frames by CRC and
+// timing, classified as master request / slave response by pairing them
+// with the last request, logged for the web page and fed to the same
+// transaction analyzer as bridged traffic - so the diagnosis and remedies
+// also work for a bus driven by another master (PLC, HMI, gateway).
+//
+// UART delivery: in this mode the RX FIFO threshold is raised to
+// SNIFF_FIFO_FULL so a frame normally arrives as ONE delivery, a couple of
+// character times after its last byte. Silence after a delivery closes a
+// "segment"; a segment can still hold several frames (fast slaves, high
+// baud), which splitSegment() separates by CRC.
+#define SNIFF_FIFO_FULL 120
+#define SNIFF_DETECT_DWELL_MS 2000
+#define SNIFF_DETECT_LOCK_FRAMES 3
+#define SNIFF_MAX_SKIP 16  // garbage bytes skipped while looking for a frame start
+
+// Auto-detect order: most common settings first.
+const ScanCombo SNIFF_DETECT_LIST[SNIFF_DETECT_COMBOS] = {
+  { 9600, 0, 0 }, { 9600, 2, 0 }, { 19200, 0, 0 }, { 19200, 2, 0 },
+  { 38400, 0, 0 }, { 115200, 0, 0 }, { 4800, 0, 0 }, { 57600, 0, 0 },
+  { 2400, 0, 0 }, { 9600, 1, 0 }, { 19200, 1, 0 }, { 38400, 2, 0 },
+  { 115200, 2, 0 }, { 9600, 0, 2 }, { 1200, 0, 0 }, { 57600, 2, 0 }
+};
+
+// Shared with webTask (sniffMux).
+SniffRequest sniffRequest;
+SniffStatus sniffStatus;
+SniffEntry sniffLog[SNIFF_LOG_SIZE];
+volatile bool sniffStartPending = false;
+volatile bool sniffStopPending = false;
+
+// bridgeTask-private.
+SniffRequest sniffReq;
+uint8_t segBuf[FRAME_BUF_SIZE * 2];
+uint16_t segLen = 0;
+uint32_t segLastUs = 0;
+bool segExpectMore = false;
+uint64_t sniffClockUs = 0;
+uint32_t sniffLastMicros = 0;
+uint32_t detectStartMs = 0;
+uint16_t detectScoreCur = 0;
+
+void sniffSetupUart(const ScanCombo &c) {
+  LineCoding lc = { c.baud, 8, c.parity, c.stopBits };
+  restartRs485(lc);
+  Serial1.setRxFIFOFull(SNIFF_FIFO_FULL);
+  Serial1.setRxTimeout(2);
+  segLen = 0;
+  segExpectMore = false;
+}
+
+// Microseconds since sniffing started, at the micros() instant t.
+uint64_t sniffTime(uint32_t t) {
+  sniffClockUs += (uint32_t)(t - sniffLastMicros);
+  sniffLastMicros = t;
+  return sniffClockUs;
+}
+
+void sniffLogAdd(uint8_t kind, const uint8_t *p, uint16_t len, uint64_t tUs) {
+  portENTER_CRITICAL(&sniffMux);
+  uint32_t seq = ++sniffStatus.lastSeq;
+  SniffEntry &e = sniffLog[seq % SNIFF_LOG_SIZE];
+  e.seq = seq;
+  e.tUs = tUs;
+  e.len = len;
+  e.kind = kind;
+  memcpy(e.bytes, p, min((int)len, SNIFF_MAX_BYTES));
+  if (kind == SK_GARBAGE) sniffStatus.garbage++;
+  else sniffStatus.frames++;
+  portEXIT_CRITICAL(&sniffMux);
+}
+
+// Length of a valid RTU frame starting at p (incremental CRC over every
+// candidate length), or 0 if none.
+uint16_t findFrameAt(const uint8_t *p, uint16_t n) {
+  if (n < 4 || p[0] > 247 || (p[1] & 0x7F) == 0) return 0;
+  uint16_t crc = 0xFFFF;
+  for (uint16_t k = 0; k + 1 < n && k <= 254; k++) {
+    // crc now covers p[0..k); candidate frame = k data bytes + 2 CRC bytes
+    if (k >= 2 && crc == ((uint16_t)p[k] | ((uint16_t)p[k + 1] << 8))) return k + 2;
+    crc ^= p[k];
+    for (uint8_t i = 0; i < 8; i++) crc = (crc & 1) ? ((crc >> 1) ^ 0xA001) : (crc >> 1);
+  }
+  return 0;
+}
+
+// Does this valid frame have the exact shape of a master request?
+bool looksLikeRequest(const uint8_t *p, uint16_t len) {
+  if (p[0] > 247) return false;
+  switch (p[1]) {
+    case 1: case 2: case 3: case 4: case 5: case 6: case 8:
+      return len == 8;
+    case 15: case 16:
+      return len >= 9 && len == 9 + p[6];
+    case 7: case 11: case 12: case 17:
+      return len == 4;
+    case 22:
+      return len == 10;
+    case 23:
+      return len >= 13 && len == 13 + p[10];
+    case 43:
+      return len == 7;
+    default:
+      return false;
+  }
+}
+
+// Stricter than a CRC match: the frame must also have the exact shape of a
+// request or a reply. Used for auto-detect scoring, where garbage at a wrong
+// baud rate would otherwise pass a CRC check about once per 65536 tries.
+bool plausibleFrame(const uint8_t *p, uint16_t len) {
+  if (looksLikeRequest(p, len)) return true;
+  if (p[0] == 0 || p[0] > 247) return false;
+  if (p[1] & 0x80) return len == 5 && p[2] >= 1 && p[2] <= 11;
+  switch (p[1]) {
+    case 1: case 2: case 3: case 4: case 17: case 23:
+      return len == 5 + p[2] && p[2] > 0;
+    case 5: case 6: case 15: case 16:
+      return len == 8;
+    default:
+      return false;
+  }
+}
+
+void sniffEmitFrame(const uint8_t *p, uint16_t len, uint64_t tUs, uint32_t atMicros) {
+  uint8_t kind;
+  bool replyShape = false;
+  if (awaiting && p[0] == reqSlave && (p[1] == reqFc || p[1] == (uint8_t)(reqFc | 0x80))) {
+    int e = expectedReplyLen(p, len, reqFc);
+    replyShape = (e == 0) || (e == (int)len);
+  }
+
+  if (replyShape) {
+    kind = (p[1] & 0x80) ? SK_EXCEPTION : SK_RESPONSE;
+    analyzerOnRx(p, len, atMicros);
+  } else if (looksLikeRequest(p, len)) {
+    kind = SK_REQUEST;
+    finalizeTransaction();  // the previous request got no (matching) reply
+    processUnsolicited();
+    memcpy(reqBuf, p, len);
+    reqLen = len;
+    reqOverflow = false;
+    analyzerOnRequest(atMicros);
+  } else {
+    kind = SK_FRAME;
+    analyzerOnRx(p, len, atMicros);
+  }
+  sniffLogAdd(kind, p, len, tUs);
+}
+
+void sniffEmitGarbage(const uint8_t *p, uint16_t len, uint64_t tUs, uint32_t atMicros) {
+  sniffLogAdd(SK_GARBAGE, p, len, tUs);
+  analyzerOnRx(p, len, atMicros);  // pending request -> CRC error, else noise
+}
+
+// Splits a closed segment into frames. While auto-detecting, only counts
+// valid frames (the score of the current setting).
+void splitSegment(bool detecting) {
+  uint32_t endMicros = segLastUs - 2 * charTimeUs;  // RX timeout = 2 symbols
+  uint64_t endT = sniffTime(endMicros);
+  uint16_t pos = 0, skipStart = 0, skipped = 0;
+
+  while (pos < segLen) {
+    uint16_t L = findFrameAt(segBuf + pos, segLen - pos);
+    if (L == 0) {
+      if (skipped == 0) skipStart = pos;
+      skipped++;
+      pos++;
+      if (skipped >= SNIFF_MAX_SKIP) {  // give up: rest of the segment is noise
+        skipped += segLen - pos;
+        pos = segLen;
+      }
+      continue;
+    }
+    uint32_t after = (uint32_t)(segLen - pos - L) * charTimeUs;
+    if (!detecting) {
+      if (skipped) sniffEmitGarbage(segBuf + skipStart, skipped, endT - after - (uint64_t)L * charTimeUs, endMicros - after - L * charTimeUs);
+      sniffEmitFrame(segBuf + pos, L, endT - after, endMicros - after);
+    } else if (plausibleFrame(segBuf + pos, L)) {
+      detectScoreCur++;
+    }
+    skipped = 0;
+    pos += L;
+  }
+  if (skipped && !detecting) sniffEmitGarbage(segBuf + skipStart, skipped, endT, endMicros);
+
+  portENTER_CRITICAL(&sniffMux);
+  sniffStatus.bytes += segLen;
+  portEXIT_CRITICAL(&sniffMux);
+  segLen = 0;
+}
+
+void sniffLock(uint8_t idx, bool autoDetected) {
+  const ScanCombo &c = SNIFF_DETECT_LIST[idx];
+  if (sniffStatus.combo.baud != c.baud || sniffStatus.combo.parity != c.parity || sniffStatus.combo.stopBits != c.stopBits) {
+    sniffSetupUart(c);
+  }
+  portENTER_CRITICAL(&sniffMux);
+  sniffStatus.state = SNIFF_RUNNING;
+  sniffStatus.combo = c;
+  sniffStatus.autoDetected = autoDetected;
+  portEXIT_CRITICAL(&sniffMux);
+  LineCoding lc = { c.baud, 8, c.parity, c.stopBits };
+  logKeyEvent("SNIFFER: bus settings detected %s", lineCodingText(lc).c_str());
+}
+
+void sniffDetectAdvance() {
+  uint8_t idx = sniffStatus.detectIdx;
+  portENTER_CRITICAL(&sniffMux);
+  sniffStatus.detectScore[idx] = detectScoreCur;
+  portEXIT_CRITICAL(&sniffMux);
+
+  if (detectScoreCur >= SNIFF_DETECT_LOCK_FRAMES) {
+    sniffLock(idx, true);
+    return;
+  }
+
+  idx++;
+  if (idx >= SNIFF_DETECT_COMBOS) {
+    // Full pass done: take the best setting that saw any valid frame.
+    uint8_t best = 0;
+    for (uint8_t i = 1; i < SNIFF_DETECT_COMBOS; i++) {
+      if (sniffStatus.detectScore[i] > sniffStatus.detectScore[best]) best = i;
+    }
+    if (sniffStatus.detectScore[best] >= 2) {
+      sniffLock(best, true);
+      return;
+    }
+    idx = 0;
+    portENTER_CRITICAL(&sniffMux);
+    if (sniffStatus.detectCycles < 255) sniffStatus.detectCycles++;
+    portEXIT_CRITICAL(&sniffMux);
+  }
+
+  portENTER_CRITICAL(&sniffMux);
+  sniffStatus.detectIdx = idx;
+  sniffStatus.combo = SNIFF_DETECT_LIST[idx];
+  portEXIT_CRITICAL(&sniffMux);
+  sniffSetupUart(SNIFF_DETECT_LIST[idx]);
+  detectScoreCur = 0;
+  detectStartMs = millis();
+}
+
+void sniffStart() {
+  portENTER_CRITICAL(&sniffMux);
+  sniffReq = sniffRequest;
+  sniffStartPending = false;
+  sniffStopPending = false;
+  uint32_t keepSeq = sniffStatus.lastSeq;  // the page keeps reading by sequence number
+  memset(&sniffStatus, 0, sizeof(sniffStatus));
+  sniffStatus.lastSeq = keepSeq;
+  sniffStatus.state = sniffReq.autoDetect ? SNIFF_DETECTING : SNIFF_RUNNING;
+  sniffStatus.forwardUsb = sniffReq.forwardUsb;
+  sniffStatus.combo = sniffReq.autoDetect ? SNIFF_DETECT_LIST[0] : sniffReq.combo;
+  sniffStatus.startedMs = millis();
+  portEXIT_CRITICAL(&sniffMux);
+
+  analyzerAbort();
+  postTransmission();  // DE/RE LOW: receive only, for the whole session
+  bridgeMode = MODE_SNIFF;
+  sniffClockUs = 0;
+  sniffLastMicros = micros();
+  detectScoreCur = 0;
+  detectStartMs = millis();
+  sniffSetupUart(sniffStatus.combo);
+
+  if (sniffReq.autoDetect) {
+    logKeyEvent("SNIFFER STARTED (auto-detecting bus settings)");
+  } else {
+    LineCoding lc = { sniffReq.combo.baud, 8, sniffReq.combo.parity, sniffReq.combo.stopBits };
+    logKeyEvent("SNIFFER STARTED at %s", lineCodingText(lc).c_str());
+  }
+}
+
+void sniffStop() {
+  if (segLen && sniffStatus.state == SNIFF_RUNNING) splitSegment(false);
+  finalizeTransaction();
+  processUnsolicited();
+  analyzerAbort();
+
+  uint32_t frames;
+  portENTER_CRITICAL(&sniffMux);
+  sniffStatus.state = SNIFF_OFF;
+  frames = sniffStatus.frames;
+  portEXIT_CRITICAL(&sniffMux);
+  sniffStopPending = false;
+
+  restartRs485(activeCoding);
+  bridgeMode = (activeCoding.baud == CONSOLE_BAUD) ? MODE_CONSOLE : MODE_BRIDGE;
+  logKeyEvent("SNIFFER STOPPED: %lu frame(s) captured", (unsigned long)frames);
+}
+
+void sniffStep() {
+  // PC -> bus is blocked: never transmit while sniffing.
+  uint32_t dropped = 0;
+  int avail;
+  while ((avail = Serial.available()) > 0) {
+    int n = Serial.read(chunk, min(avail, (int)CHUNK_SIZE));
+    if (n <= 0) break;
+    dropped += n;
+  }
+  if (dropped) {
+    portENTER_CRITICAL(&sniffMux);
+    sniffStatus.droppedHostBytes += dropped;
+    portEXIT_CRITICAL(&sniffMux);
+  }
+
+  if (sniffStopPending) {
+    sniffStop();
+    return;
+  }
+
+  bool detecting = (sniffStatus.state == SNIFF_DETECTING);
+
+  int got = 0;
+  while ((avail = Serial1.available()) > 0) {
+    int n = Serial1.read(chunk, min(avail, (int)CHUNK_SIZE));
+    if (n <= 0) break;
+    if (!detecting && sniffReq.forwardUsb) Serial.write(chunk, n);
+    for (int i = 0; i < n; i++) {
+      if (segLen >= sizeof(segBuf)) splitSegment(detecting);
+      segBuf[segLen++] = chunk[i];
+    }
+    got += n;
+  }
+  uint32_t now = micros();
+  if (got) {
+    segLastUs = now;
+    segExpectMore = (got >= SNIFF_FIFO_FULL);  // FIFO-full delivery: frame continues
+    lastBusActivityUs = now;
+    ledRxUntil = millis() + LED_FLASH_MS;
+  }
+
+  if (segLen) {
+    uint32_t quiet = segExpectMore ? (SNIFF_FIFO_FULL + 8) * charTimeUs : max((uint32_t)1500, 4 * charTimeUs);
+    if (now - segLastUs > quiet) splitSegment(detecting);
+  }
+
+  if (detecting) {
+    if (detectScoreCur >= SNIFF_DETECT_LOCK_FRAMES || millis() - detectStartMs >= SNIFF_DETECT_DWELL_MS) {
+      sniffDetectAdvance();
+    }
+  } else {
+    analyzerTick(micros());
+    sampleIdleLine(micros());
+  }
+}
+
 // ===================== bridgeTask (Core 1) =====================
 void bridgeTask(void *arg) {
   for (;;) {
-    if (scanStartPending && bridgeMode != MODE_SCAN) {
+    if (scanStartPending && bridgeMode != MODE_SCAN && bridgeMode != MODE_SNIFF) {
       scanStart();
+    }
+    if (sniffStartPending && bridgeMode != MODE_SCAN && bridgeMode != MODE_SNIFF) {
+      sniffStart();
+    }
+
+    if (bridgeMode == MODE_SNIFF) {
+      sniffStep();
+      ledUpdate();
+      vTaskDelay(1);
+      continue;
     }
 
     if (bridgeMode == MODE_SCAN) {
