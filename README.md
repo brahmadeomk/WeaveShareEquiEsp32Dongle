@@ -92,19 +92,45 @@ their raw request and reply bytes in hex.
   - **HIGH** is correct.
   - **LOW** means A/B are swapped, or there's no fail-safe bias.
   - **UNSTABLE** means the bus is floating and picking up noise.
-- **Rule-based diagnosis:** the counters are turned into findings, each with a
-  cause and a fix. Each finding is rated FAULT, WARN, INFO or OK. Examples:
-  - *Slave 3 never answers.* The page lists what to check, in order. If garbled
-    bytes were seen, it says the settings are probably mismatched and points to
-    Auto-scan.
-  - *Every reply is corrupted* → baud/parity mismatch. *2 % corrupted replies* →
-    termination, shielding or grounding.
-  - *Stopped responding* after working: that device's power or cable.
-  - *Exception 02* → explains 0-based vs 40001-style register numbering.
-    Exception 01 → try FC03 vs FC04. Exception 03 → quantity limits.
-  - *Another master is active*, *stray byte in front of replies* (bias
-    missing), *replies from another ID* (duplicate address), *slow
-    responder*.
+- **Rule-based diagnosis with remedies:** the counters are turned into
+  findings, rated FAULT, WARN, INFO or OK. Each finding shows three things:
+  - **Likely cause:** what is most probably wrong, with the real numbers (for
+    example *No reply at all to 8 request(s) at 9600 8N1*).
+  - **Remedy:** a numbered checklist to work through, in the order that
+    usually finds the problem fastest.
+  - **An action button** where one helps: *Open Auto-scan*, *Open Settings*,
+    or *Reset statistics (after fixing)* to confirm the fix worked.
+
+  ![Diagnostics page showing findings with likely cause and remedy steps](docs/images/dashboard-remedies.png)
+
+  Findings and remedies:
+
+  | Finding | Likely cause | Remedy (summary) |
+  |---|---|---|
+  | **RS485 bus idles LOW** (FAULT) | A/B swapped, or no fail-safe bias | Swap A/B at the dongle. If it's still LOW with the bus connected, add about 680 Ω bias (A to +5 V, B to GND) at one point, or enable one device's bias switch |
+  | **Idle line level unstable** (WARN) | Floating bus picks up noise | Add bias at one point, 120 Ω termination at both ends, shielded twisted pair |
+  | **Line held LOW / break events** (WARN) | Swapped pair, short, or a transmitter stuck on | Check polarity, measure A-B idle voltage (+0.2 V or more is good), disconnect devices one at a time |
+  | **Slave N never answers** (FAULT) | Device off, wrong ID, wrong settings, or wiring | Power and LED, ID, baud/parity/stop, A/B and GND, port enabled as Modbus RTU slave; *Open Auto-scan* if unknown |
+  | **Every reply is corrupted** (FAULT) | Baud/parity/stop-bit mismatch | Match the master to the device's settings exactly, or find them with Auto-scan; if they match, treat it as noise |
+  | **A different device answers** (FAULT) | Device configured with another ID | The first reply byte in *Recent transactions* is the real ID: poll that ID or readdress the device |
+  | **Slave N stopped responding** (FAULT) | Power, cable or settings changed at that device | Check supply/fuse, connector and spur, settings; power-cycle; follow the cable from the last device that still answers |
+  | **Intermittent timeouts** (WARN/FAULT) | Slow device (late replies seen) or lost frames | Late replies: raise the master timeout to the recommended value. Otherwise: longer poll interval, retries, then the noise checklist |
+  | **N % corrupted replies** (WARN/FAULT) | Noise, reflections, weak signal | 120 Ω at both ends only, shield earthed at one end, common GND, away from VFD/motor cables, short stubs, lower baud on long runs |
+  | **Replies from another ID** (WARN) | Duplicate address, or a late reply overlapping | Unique IDs (check with Auto-scan), longer master timeout |
+  | **Exception 01** (WARN) | Function code not supported | Switch FC03 ⇄ FC04 (or FC01/FC02, FC06/FC16) per the manual |
+  | **Exception 02** (WARN) | Register not in the device map | 40001 → address 0 (remove prefix, minus 1), 1-based → minus 1, smaller blocks, master's base-0/base-1 option |
+  | **Exception 03** (WARN) | Quantity or value rejected | At most 125 registers per read (try 10-20), even count for 32-bit values, check write ranges |
+  | **Exception 04** (FAULT) | Device internal error | Check device alarms, power-cycle, check the operating mode, contact the vendor with the request bytes |
+  | **Exception 05/06** (INFO) | Device busy | Longer poll interval, retries, don't write during a running command |
+  | **Exception 0A/0B** (WARN) | Gateway can't route / target silent | Gateway unit-ID mapping, downstream device power and link, longer timeout |
+  | **Slow responder** (INFO) | Device takes > 200 ms | Master timeout at least the recommended value, poll interval above it |
+  | **Another device is talking on the bus** (WARN) | A second master is polling | Find it from the FOREIGN rows, stop or disconnect it, or use a separate segment |
+  | **Stray byte in front of replies** (WARN) | Transceiver switching without bias | Add fail-safe bias at one point |
+  | **Noise between frames** (WARN) | Noise, or a device at another baud rate | Noise checklist, then Auto-scan for a mismatched device |
+  | **UART framing/parity errors** (WARN) | Settings mismatch or distorted signal | Settings checklist if a device never answers, otherwise the noise checklist |
+  | **Data overflow** (WARN) | PC not reading the port fast enough | Close other programs on the port, don't burst requests, another USB port/cable |
+  | **Bad CRC from the PC / not Modbus RTU** | Master set to ASCII or RTU-over-TCP | Set the master's protocol to Modbus RTU |
+
 - **Recommended master response timeout:** worked out from the slowest reply
   seen (2 × the worst latency + 20 ms, at least 100 ms).
 - **LED verdict:** red blink = FAULT, yellow blink = WARN (every 2 s, when the

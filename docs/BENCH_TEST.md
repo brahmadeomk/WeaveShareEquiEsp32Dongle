@@ -202,6 +202,11 @@ the fault, poll with F1 (`--repeat 20` unless stated) and read the **findings**
 at the top of the page. The expected verdict is the minimum. Other findings
 caused by the same fault are acceptable.
 
+For every finding, also check that the page shows a **Likely cause**, a
+numbered **Remedy** list and, where relevant, an action button. Then apply
+the remedy, press **Reset statistics**, poll again and confirm that the
+finding clears.
+
 | Test | Fault to create | Expected finding (verdict) |
 |---|---|---|
 | **D1 Healthy baseline** | None. F1 with `--repeat 50` | **Bus healthy** (OK), success 100 %, plus a recommended master timeout. Idle level **HIGH (correct)** |

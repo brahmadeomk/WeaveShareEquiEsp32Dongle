@@ -46,11 +46,13 @@ int main(){
     if(findings[i].title.s.find("exception 02")!=std::string::npos) foundExc2=true;
     if(findings[i].title.s.find("Another device")!=std::string::npos) foundForeign=true;
     if(findings[i].title.s.find("Stray byte")!=std::string::npos) foundGlitch=true; }
+  for(int i=0;i<findingCount;i++){ CHECK(findings[i].cause.length()>0); CHECK(findings[i].remedy.length()>0); }
+  { int steps=1; for(char c: findings[0].remedy.s) if(c=='\n') steps++; printf("  first finding remedy has %d step(s)\n", steps); }
   CHECK(foundNever); CHECK(foundExc2); CHECK(foundForeign); CHECK(foundGlitch); CHECK(overallSev==SEV_FAULT);
   // 13) healthy bus
-  resetStatistics(); for(int i=0;i<30;i++){ sendReq({1,3,0,0,0,1}); rx({1,3,2,0,i}); idle(20);} runDiagnosis();
+  resetStatistics(); for(int i=0;i<30;i++){ sendReq({1,3,0,0,0,1}); rx({1,3,2,0,(uint8_t)i}); idle(20);} runDiagnosis();
   CHECK(overallSev<=SEV_INFO); CHECK(findingCount>=1 && findings[findingCount-1].title=="Bus healthy");
-  printf("  %s\n", findings[findingCount-1].detail.c_str());
+  printf("  %s / %s\n", findings[findingCount-1].cause.c_str(), findings[findingCount-1].remedy.c_str());
   // 14) dead after working
   for(int i=0;i<6;i++){ sendReq({1,3,0,0,0,1}); idle(1100);} runDiagnosis(); bool down=false;
   for(int i=0;i<findingCount;i++) if(findings[i].title=="Slave 1 stopped responding") down=true; CHECK(down);

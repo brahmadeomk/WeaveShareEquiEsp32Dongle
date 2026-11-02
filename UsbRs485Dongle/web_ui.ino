@@ -361,14 +361,24 @@ void resetStatistics() {
   idleLevel = IDLE_UNKNOWN;
 }
 
-void addFinding(uint8_t sev, const String &title, const String &detail) {
+// cause: one or two sentences. remedy: steps separated by '\n', shown as a
+// numbered checklist. action: optional button (Auto-scan, Reset statistics...).
+// (No default argument: the Arduino builder copies signatures into
+// auto-generated prototypes, and a default given twice fails to compile.)
+void addFinding(uint8_t sev, const String &title, const String &cause, const String &remedy, uint8_t action) {
   if (findingCount < MAX_FINDINGS) {
-    findings[findingCount].sev = sev;
-    findings[findingCount].title = title;
-    findings[findingCount].detail = detail;
-    findingCount++;
+    Finding &f = findings[findingCount++];
+    f.sev = sev;
+    f.action = action;
+    f.title = title;
+    f.cause = cause;
+    f.remedy = remedy;
   }
   if (sev > overallSev) overallSev = sev;
+}
+
+void addFinding(uint8_t sev, const String &title, const String &cause, const String &remedy) {
+  addFinding(sev, title, cause, remedy, ACT_NONE);
 }
 
 String msText(uint32_t us) {
@@ -423,38 +433,85 @@ const char *sevName(uint8_t s) {
   }
 }
 
+// Common remedy step lists, reused by several findings.
+#define STEPS_SETTINGS_MISMATCH(line) \
+  String("Find the device's communication settings (manual, front panel or its configuration software) and compare them with the PC port: ") + line + ".\n" \
+  "Set the Modbus master to the device's baud rate, parity and stop bits exactly (8E1 and 8N1 are the most common).\n" \
+  "If the settings are unknown, close the master and run Auto-scan - it reports the baud rate, format and ID that answer.\n" \
+  "Press Reset statistics and poll again to confirm."
+
+#define STEPS_NOISE \
+  "Fit a 120 \u03A9 termination resistor across A-B at the two physical ends of the cable only (not at every device).\n" \
+  "Use shielded twisted pair, A and B on one pair; connect the shield to earth at one end only.\n" \
+  "Connect the RS485 GND/COM of all devices together (signal reference).\n" \
+  "Route the cable away from VFD, motor and contactor wiring; cross power cables at 90\u00B0.\n" \
+  "Wire the bus as a daisy chain and keep stubs to each device short (< 1 m).\n" \
+  "If the cable is long (> 300 m at 19200 baud and above), reduce the baud rate.\n" \
+  "Press Reset statistics and poll again to confirm."
+
+#define STEPS_BIAS \
+  "Add fail-safe bias at ONE point on the bus (usually at the master end): about 680 \u03A9 from A (D+) to +5 V and 680 \u03A9 from B (D-) to GND.\n" \
+  "Check whether a device already has switchable bias/termination (DIP switch) - enable it on one device only.\n" \
+  "Press Reset statistics and check that the idle level reads HIGH."
+
 void diagnoseExceptions(const String &sid, const SlaveStats &s) {
   for (uint8_t code = 1; code < 16; code++) {
     if (!(s.excMask & (1 << code))) continue;
     switch (code) {
       case 1:
         addFinding(SEV_WARN, sid + ": function not supported (exception 01)",
-                   "The device rejects this function code. Many meters implement only FC03 (holding registers) or only FC04 (input registers): try the other one, or check the device manual.");
+                   "The device answered but does not implement the function code that was requested.",
+                   "Check the device manual for the supported function codes.\n"
+                   "Measured values are often input registers: switch the master between FC03 (Read Holding Registers) and FC04 (Read Input Registers).\n"
+                   "For coils/discrete inputs use FC01/FC02, for writes FC06 (single) or FC16 (multiple) - some devices support only one of the two.\n"
+                   "Press Reset statistics and poll again to confirm.", ACT_RESET);
         break;
       case 2:
         addFinding(SEV_WARN, sid + ": illegal data address (exception 02)",
-                   "A requested register does not exist in this device. Check the numbering: manuals often list 40001/30001-style or 1-based numbers, while the request on the wire is 0-based. Try the address minus 1 without the 4xxxx/3xxxx prefix, and make sure a block read doesn't cross a gap in the register map.");
+                   "The device answered, but the requested register (or part of the block) does not exist in its register map.",
+                   "Look up the register in the device manual.\n"
+                   "If the manual lists 40001-style numbers (holding) or 30001-style (input), remove the prefix and subtract 1: 40001 becomes address 0, 30010 becomes address 9.\n"
+                   "If the manual is 1-based (register 1 = first register), subtract 1 from the address.\n"
+                   "If you read a block, reduce the quantity - the block may cross a gap in the register map. Read the registers one at a time to find the gap.\n"
+                   "Check whether the master software has a 'base 0 / base 1' or 'PLC addresses' option and set it to match the manual.\n"
+                   "Press Reset statistics and poll again to confirm.", ACT_RESET);
         break;
       case 3:
         addFinding(SEV_WARN, sid + ": illegal data value (exception 03)",
-                   "Quantity or value not accepted. Read at most 125 registers (2000 coils) per request, and keep written values inside the range the device allows.");
+                   "The device rejected the quantity in the request, or a value being written.",
+                   "Read at most 125 registers (FC03/FC04) or 2000 coils (FC01/FC02) per request; many devices accept far less - try 10-20.\n"
+                   "32-bit values need an even quantity starting at the right register (e.g. 2 registers).\n"
+                   "For writes, check the allowed range and units in the manual (scaling, decimals).\n"
+                   "Press Reset statistics and poll again to confirm.", ACT_RESET);
         break;
       case 4:
         addFinding(SEV_FAULT, sid + ": device failure (exception 04)",
-                   "The device reported an internal error while processing the request. Check the device itself (alarms, configuration, firmware).");
+                   "The device reported an internal error while processing the request.",
+                   "Check the device display/LEDs for alarms or a configuration error.\n"
+                   "Power-cycle the device.\n"
+                   "Check that the request is valid for the device's current operating mode (some registers can only be written when stopped).\n"
+                   "If it persists, contact the device manufacturer with the request bytes shown under Recent transactions.");
         break;
       case 5:
       case 6:
         addFinding(SEV_INFO, sid + ": device busy (exception 05/06)",
-                   "The device is busy with a long operation. Poll it more slowly or retry later.");
+                   "The device is busy with a long-running operation and asks the master to retry later.",
+                   "Increase the poll interval for this device.\n"
+                   "Enable retries in the master software.\n"
+                   "Avoid writing to the device while it is executing a previous command.");
         break;
       case 10:
       case 11:
         addFinding(SEV_WARN, sid + ": gateway error (exception 0A/0B)",
-                   "This address belongs to a Modbus gateway that cannot reach (0A) or got no answer from (0B) the downstream device behind it.");
+                   "This ID belongs to a Modbus gateway. 0A: it has no route to the target. 0B: the target behind it did not answer.",
+                   "Check the gateway's routing table / unit-ID mapping for this ID.\n"
+                   "Check that the downstream device is powered and connected to the gateway.\n"
+                   "Increase the master timeout - requests through a gateway take longer.");
         break;
       default:
-        addFinding(SEV_INFO, sid + ": exception " + String(code), String(excName(code)) + " reported by the device.");
+        addFinding(SEV_INFO, sid + ": exception " + String(code),
+                   String(excName(code)) + " reported by the device.",
+                   "Look up exception code " + String(code) + " in the device manual.");
         break;
     }
   }
@@ -471,29 +528,48 @@ void runDiagnosis() {
   uint8_t il = idleLevel;
 
   if (mode == MODE_SCAN) {
-    addFinding(SEV_INFO, "Auto-scan in progress", "The dongle owns the bus. Bytes from the PC are discarded until the scan ends.");
+    addFinding(SEV_INFO, "Auto-scan in progress",
+               "The dongle owns the bus. Bytes from the PC are discarded until the scan ends.",
+               "Wait for the scan to finish, or stop it on the Auto-scan page.", ACT_SCAN);
   } else if (mode == MODE_CONSOLE) {
-    addFinding(SEV_INFO, "USB console mode", "The PC opened the port at " + String(CONSOLE_BAUD) + " baud, so nothing is bridged. Re-open the port at the bus baud rate to resume.");
+    addFinding(SEV_INFO, "USB console mode",
+               "The PC opened the port at " + String(CONSOLE_BAUD) + " baud, so nothing is bridged.",
+               "Close the serial terminal.\nOpen the COM port again at the bus baud rate in your Modbus master.");
   } else if (!hostOpen) {
-    addFinding(SEV_INFO, "PC port not open", "No application has the COM port open. Open it in your Modbus master software.");
+    addFinding(SEV_INFO, "PC port not open",
+               "No application has the COM port open.",
+               "Open the dongle's COM port in your Modbus master software.\n"
+               "If the port is missing on the PC, re-plug the USB cable and check Device Manager (Windows) or /dev/ttyACM* (Linux).");
   }
 
   // ---- physical layer ----
   if (il == IDLE_LOW) {
     addFinding(SEV_FAULT, "RS485 bus idles LOW",
-               "Between frames the receiver reads a constant 0. Usual causes: A and B swapped, or no fail-safe bias on the bus. Swap A/B first; if that doesn't help, add bias resistors (about 680 &Omega; from A to +5 V and from B to GND, at one point on the bus).");
+               "Between frames the receiver reads a constant 0. Usual causes: A and B swapped, or no fail-safe bias on the bus.",
+               "Swap the A and B wires at the dongle (labelling differs between vendors: A/B, D+/D-, +/-).\n"
+               "Press Reset statistics and check the idle level - it should read HIGH within a few seconds.\n"
+               "If it stays LOW with nothing connected except the dongle, check the dongle's transceiver wiring (RO to D2, DE/RE to D4).\n"
+               "If it is LOW only with the bus connected: " STEPS_BIAS, ACT_RESET);
   } else if (il == IDLE_UNSTABLE) {
     addFinding(SEV_WARN, "Idle line level unstable",
-               "The bus floats between frames and picks up noise. Add fail-safe bias resistors (about 680 &Omega; A to +5 V, B to GND, at one point) and 120 &Omega; termination at the two ends of the cable only.");
+               "The bus floats between frames and picks up noise, so receivers can see false start bits.",
+               STEPS_BIAS "\nThen check termination: " STEPS_NOISE, ACT_RESET);
   }
   if (snapG.uartBreaks > 0 && il != IDLE_LOW) {
     addFinding(SEV_WARN, "Line held LOW (" + String(snapG.uartBreaks) + " break event(s))",
-               "The bus was held at 0 for longer than a character. Check A/B polarity, and look for a device whose transmitter stays switched on.");
+               "The bus was held at 0 for longer than a character: a swapped pair, a short, or a device whose transmitter stays on.",
+               "Check A/B polarity at every device.\n"
+               "Measure A-B with a multimeter while the bus is idle: about +0.2 V or more is good, near 0 V means no bias, negative means swapped or a device driving the bus.\n"
+               "Disconnect devices one at a time to find one that holds the bus.\n"
+               "Press Reset statistics and watch whether break events return.", ACT_RESET);
   }
 
   uint32_t total = snapG.requests;
   if (total == 0 && snapG.nonRtuRequests == 0 && snapG.broadcasts == 0 && mode == MODE_BRIDGE) {
-    addFinding(SEV_INFO, "No Modbus traffic yet", "Start polling from your Modbus master on this COM port (currently " + line + ").");
+    addFinding(SEV_INFO, "No Modbus traffic yet",
+               "The PC hasn't sent any Modbus RTU request through the dongle since the statistics were reset.",
+               "Start polling from your Modbus master on this COM port (currently " + line + ").\n"
+               "Or run Auto-scan to find the devices on the bus first.", ACT_SCAN);
   }
 
   // ---- per slave ----
@@ -513,22 +589,36 @@ void runDiagnosis() {
     String sid = "Slave " + String(id);
 
     if (id > 247) {
-      addFinding(SEV_WARN, sid + ": reserved address", "IDs 248-255 are reserved by the Modbus specification; most devices cannot use them.");
+      addFinding(SEV_WARN, sid + ": reserved address",
+                 "IDs 248-255 are reserved by the Modbus specification; most devices cannot use them.",
+                 "Configure the device and the master to use an ID between 1 and 247.");
     }
 
     if (replies == 0 && s.requests >= 3) {
       if (s.crcErrors > 0) {
         addFinding(SEV_FAULT, sid + ": every reply is corrupted",
-                   "Bytes come back but never as a valid frame. This is almost always a baud rate / parity / stop-bit mismatch: the PC port is set to " + line + ". Check the device's communication settings, or find them with Auto-scan.");
+                   "Bytes come back but never as a valid frame. This is almost always a baud rate / parity / stop-bit mismatch (the PC port is set to " + line + ").",
+                   STEPS_SETTINGS_MISMATCH(line) + "\nIf the settings definitely match, treat it as noise: " STEPS_NOISE, ACT_SCAN);
       } else if (s.wrongSlave > 0) {
         addFinding(SEV_FAULT, sid + ": a different device answers",
-                   "Valid replies come back, but from another slave ID. Check the address configured in the device; two devices may share one.");
+                   "Valid replies come back, but from another slave ID - the device is configured with a different address than the master expects.",
+                   "Look at Recent transactions: the first byte of the reply is the ID the device actually uses.\n"
+                   "Either poll that ID, or change the device's address to " + String(id) + ".\n"
+                   "Make sure no two devices on the bus share an ID.\n"
+                   "Press Reset statistics and poll again to confirm.", ACT_RESET);
       } else if (garbledSeen) {
         addFinding(SEV_FAULT, sid + " never answers",
-                   "No reply to " + String(s.requests) + " request(s), and garbled bytes were seen on the bus: a device is probably talking at different settings than " + line + ". Run Auto-scan to find its baud rate and parity.");
+                   "No reply to " + String(s.requests) + " request(s), and garbled bytes were seen on the bus: a device is probably talking at different settings than " + line + ".",
+                   STEPS_SETTINGS_MISMATCH(line), ACT_SCAN);
       } else {
         addFinding(SEV_FAULT, sid + " never answers",
-                   "No reply to " + String(s.requests) + " request(s) at " + line + ". Check in this order: device powered, slave ID, the device's baud rate/parity, A/B wiring (swap if unsure), common GND. Auto-scan finds a device whose settings are unknown.");
+                   "No reply at all to " + String(s.requests) + " request(s) at " + line + ".",
+                   "Check the device is powered and its communication LED (if any) blinks when polled.\n"
+                   "Check the slave ID configured in the device matches ID " + String(id) + ".\n"
+                   "Check the device's baud rate, parity and stop bits match " + line + ".\n"
+                   "Check the wiring: A to A, B to B (swap A/B if unsure - it does no harm), and a common GND.\n"
+                   "Check the device's Modbus/RS485 port is enabled and set to Modbus RTU slave (not ASCII, not master).\n"
+                   "If the ID or settings are unknown, close the master and run Auto-scan.", ACT_SCAN);
       }
       continue;
     }
@@ -536,17 +626,29 @@ void runDiagnosis() {
     if (replies > 0 && s.consecTimeouts >= diagDeadSlaveThreshold) {
       uint32_t ago = (millis() - s.lastReplyMs) / 1000;
       addFinding(SEV_FAULT, sid + " stopped responding",
-                 "It answered " + String(s.okBeforeOutage) + " request(s), but the last " + String(s.consecTimeouts) + " timed out (last good reply " + String(ago) + " s ago). Check that device's power, its cable spur and connectors.");
+                 "It answered " + String(s.okBeforeOutage) + " request(s), but the last " + String(s.consecTimeouts) + " timed out (last good reply " + String(ago) + " s ago). Something changed at that device or its cable.",
+                 "Check the device is still powered (supply, fuse, breaker) and not in an alarm/reboot loop.\n"
+                 "Check the RS485 connector and cable spur to that device; follow the cable back to the last device that still answers.\n"
+                 "Check nobody changed the device's ID or communication settings.\n"
+                 "Power-cycle the device.\n"
+                 "When it answers again, the finding clears; press Reset statistics to clear the history.", ACT_RESET);
     } else if (s.requests >= 20) {
       float toPct = 100.0f * s.timeouts / s.requests;
       if (toPct >= 2.0f) {
-        String d = String(toPct, 1) + "% of requests got no reply. ";
         if (s.lateReplies > 0) {
-          d += String(s.lateReplies) + " reply(ies) arrived after the dongle had stopped waiting: the device is slower than expected. Set the master's response timeout to at least " + String(recommendTimeoutMs(s.latMaxUs)) + " ms.";
+          addFinding(toPct >= 20.0f ? SEV_FAULT : SEV_WARN, sid + ": intermittent timeouts",
+                     String(toPct, 1) + "% of requests got no reply in time, and " + String(s.lateReplies) + " reply(ies) arrived later: the device answers, but slower than the timeout.",
+                     "Set the master's response timeout to at least " + String(recommendTimeoutMs(s.latMaxUs)) + " ms.\n"
+                     "Set the dongle's diagnostic reply timeout (Settings) to the same value so both agree.\n"
+                     "Make the poll interval longer than the response timeout.\n"
+                     "Press Reset statistics and poll again to confirm.", ACT_SETTINGS);
         } else {
-          d += "Typical causes: noise or missing termination, the device busy with other work, or polling too fast. Try a longer poll interval and check the 120 &Omega; termination at both cable ends.";
+          addFinding(toPct >= 20.0f ? SEV_FAULT : SEV_WARN, sid + ": intermittent timeouts",
+                     String(toPct, 1) + "% of requests got no reply: occasional lost frames from noise, a busy device, or polling too fast.",
+                     "Increase the poll interval (some devices need 50-100 ms between requests).\n"
+                     "Enable 1-2 retries in the master software.\n"
+                     "Increase the master's response timeout to " + String(recommendTimeoutMs(s.latMaxUs)) + " ms or more.\n" STEPS_NOISE, ACT_RESET);
         }
-        addFinding(toPct >= 20.0f ? SEV_FAULT : SEV_WARN, sid + ": intermittent timeouts", d);
       }
     }
 
@@ -554,67 +656,92 @@ void runDiagnosis() {
       float crcPct = 100.0f * s.crcErrors / s.requests;
       if (crcPct >= 1.0f) {
         addFinding(crcPct >= 10.0f ? SEV_FAULT : SEV_WARN, sid + ": " + String(crcPct, 1) + "% corrupted replies",
-                   "Electrical noise or signal reflections. Fit 120 &Omega; termination at both ends of the bus (not at every device), use shielded twisted pair with a common GND, keep the cable away from VFD/motor wiring, and keep stubs short.");
+                   "Some replies arrive damaged: electrical noise, signal reflections or a weak signal.",
+                   STEPS_NOISE, ACT_RESET);
       }
     }
 
     if (s.wrongSlave > 0) {
       addFinding(SEV_WARN, sid + ": replies from another ID",
-                 String(s.wrongSlave) + " reply(ies) came from a different slave ID. Either two devices share an address, or a slow device answered an earlier request after the master had moved on. Give every device a unique ID and lengthen the master timeout.");
+                 String(s.wrongSlave) + " reply(ies) came from a different slave ID: two devices share an address, or a slow device answered an earlier request after the master had moved on.",
+                 "Check every device on the bus has a unique ID (run Auto-scan with the master stopped - duplicates show as garbled).\n"
+                 "Increase the master's response timeout to " + String(recommendTimeoutMs(worstLatUs)) + " ms so late replies don't overlap the next request.\n"
+                 "Press Reset statistics and poll again to confirm.", ACT_SCAN);
     }
     if (s.badFunction > 0) {
       addFinding(SEV_WARN, sid + ": unexpected function code in reply",
-                 String(s.badFunction) + " reply(ies) carried a different function code than the request. Usually a device or gateway firmware issue.");
+                 String(s.badFunction) + " reply(ies) carried a different function code than the request - usually a device or gateway firmware issue.",
+                 "Check the device firmware version and manual for known Modbus issues.\n"
+                 "If the device sits behind a gateway, check the gateway's protocol settings.");
     }
 
     diagnoseExceptions(sid, s);
 
     if (s.latCount >= 3 && s.latMaxUs > 200000) {
       addFinding(SEV_INFO, sid + ": slow responder",
-                 "Replies take " + msText(s.latSumUs / s.latCount) + " ms on average, up to " + msText(s.latMaxUs) + " ms. Set the master's response timeout to at least " + String(recommendTimeoutMs(s.latMaxUs)) + " ms and keep the poll interval above that.");
+                 "Replies take " + msText(s.latSumUs / s.latCount) + " ms on average, up to " + msText(s.latMaxUs) + " ms.",
+                 "Set the master's response timeout to at least " + String(recommendTimeoutMs(s.latMaxUs)) + " ms.\n"
+                 "Keep the poll interval above that value.\n"
+                 "Read larger blocks less often instead of many small requests.", ACT_SETTINGS);
     }
   }
 
   // ---- bus-wide ----
   if (snapG.foreignFrames > 0) {
     addFinding(SEV_WARN, "Another device is talking on the bus",
-               String(snapG.foreignFrames) + " valid Modbus frame(s) appeared that were not replies to requests sent through this dongle. Only one master may poll an RS485 segment: disconnect or disable the other PLC/HMI/gateway, otherwise frames collide.");
+               String(snapG.foreignFrames) + " valid Modbus frame(s) appeared that were not replies to requests sent through this dongle - another master (PLC, HMI, gateway, meter reader) is polling the same bus.",
+               "Find the other master: look at Recent transactions (FOREIGN rows) to see which IDs it polls.\n"
+               "Stop or disconnect it while you use this dongle - two masters on one RS485 segment cause collisions.\n"
+               "If both must run, put the dongle on a separate segment or use the other master's pass-through/gateway function.\n"
+               "Press Reset statistics and confirm FOREIGN frames stop.", ACT_RESET);
   }
   if (snapG.glitchBytes > 0) {
     addFinding(SEV_WARN, "Stray byte in front of replies",
-               String(snapG.glitchBytes) + " reply(ies) started with an extra byte (often 0x00 or 0xFF), caused by a transceiver switching without fail-safe bias. Add bias resistors; many master programs report these replies as CRC errors.");
+               String(snapG.glitchBytes) + " reply(ies) started with an extra byte (often 0x00 or 0xFF) produced when a transceiver switches with no fail-safe bias. Many masters report these replies as CRC errors.",
+               STEPS_BIAS, ACT_RESET);
   }
   if (snapG.noiseBytes >= 10 && (uint64_t)snapG.noiseBytes * 100 >= (uint64_t)max(snapG.rxBytes, (uint32_t)1) * 2) {
     addFinding(SEV_WARN, "Noise between frames",
-               String(snapG.noiseBytes) + " received byte(s) belonged to no frame. Check termination, bias, shielding and grounding, and that no device transmits at a different baud rate.");
+               String(snapG.noiseBytes) + " received byte(s) belonged to no frame.",
+               STEPS_NOISE "\nAlso check that no device on the bus is set to a different baud rate (run Auto-scan with the master stopped).", ACT_RESET);
   }
   if (garbledSeen) {
     addFinding(SEV_WARN, "UART framing/parity errors",
-               String(snapG.uartFrameErrors) + " framing and " + String(snapG.uartParityErrors) + " parity error(s) at " + line + ": a device on the bus uses different settings, or the signal is distorted. Run Auto-scan if a device never answers.");
+               String(snapG.uartFrameErrors) + " framing and " + String(snapG.uartParityErrors) + " parity error(s) at " + line + ": a device uses different settings, or the signal is distorted.",
+               "If a device never answers, it is most likely a settings mismatch: " + STEPS_SETTINGS_MISMATCH(line) + "\nIf all devices answer, treat it as noise: " STEPS_NOISE, ACT_SCAN);
   }
   if (snapG.uartOverflows + snapG.usbOverflows > 0) {
     addFinding(SEV_WARN, "Data overflow",
-               "Data arrived faster than it could be passed on (" + String(snapG.uartOverflows) + " RS485, " + String(snapG.usbOverflows) + " USB). Close other programs using the COM port and avoid very large request bursts.");
+               "Data arrived faster than it could be passed on (" + String(snapG.uartOverflows) + " RS485, " + String(snapG.usbOverflows) + " USB): the PC application is not reading the port quickly enough.",
+               "Close other programs that may hold or poll the COM port.\n"
+               "Avoid sending many requests back-to-back without waiting for replies.\n"
+               "Try a different USB port/cable (avoid unpowered hubs).", ACT_RESET);
   }
   if (snapG.nonRtuRequests > 0) {
     if (total == 0) {
       addFinding(SEV_INFO, "PC traffic is not Modbus RTU",
-                 String(snapG.nonRtuRequests) + " request(s) had no valid RTU CRC. This is probably Modbus ASCII or another protocol: data still passes through unchanged, but the diagnostics only cover Modbus RTU.");
+                 String(snapG.nonRtuRequests) + " request(s) had no valid RTU CRC - probably Modbus ASCII or another protocol. Data still passes through unchanged; the diagnostics only cover Modbus RTU.",
+                 "If you intended Modbus RTU, set the master's protocol to 'Modbus RTU' (not ASCII, not RTU-over-TCP).");
     } else {
       addFinding(SEV_WARN, "Some PC requests had a bad CRC",
-                 String(snapG.nonRtuRequests) + " request(s) from the PC were not valid RTU frames. Check the master's protocol setting (RTU, not ASCII or RTU-over-TCP).");
+                 String(snapG.nonRtuRequests) + " request(s) from the PC were not valid RTU frames.",
+                 "Set the master's protocol to 'Modbus RTU' (not ASCII or RTU-over-TCP).\n"
+                 "Close other programs that might write to the same COM port.\n"
+                 "Press Reset statistics and poll again to confirm.", ACT_RESET);
     }
   }
   if (snapG.scanDroppedBytes > 0 && mode != MODE_SCAN) {
     addFinding(SEV_INFO, "PC data was discarded during a scan",
-               String(snapG.scanDroppedBytes) + " byte(s) from the PC arrived while Auto-scan owned the bus and were dropped. Stop the master before scanning.");
+               String(snapG.scanDroppedBytes) + " byte(s) from the PC arrived while Auto-scan owned the bus and were dropped.",
+               "Stop the Modbus master before starting Auto-scan.\nPress Reset statistics to clear this note.", ACT_RESET);
   }
 
   recommendedTimeoutMs = recommendTimeoutMs(worstLatUs);
   if (overallSev <= SEV_INFO && total > 0) {
     float pct = 100.0f * answered / total;
     addFinding(SEV_OK, "Bus healthy",
-               String(pct, 1) + "% of " + String(total) + " request(s) answered by " + String(slavesAnswering) + " slave(s); slowest reply " + msText(worstLatUs) + " ms. Recommended master response timeout: " + String(recommendedTimeoutMs) + " ms.");
+               String(pct, 1) + "% of " + String(total) + " request(s) answered by " + String(slavesAnswering) + " slave(s); slowest reply " + msText(worstLatUs) + " ms.",
+               "No action needed.\nRecommended master response timeout: " + String(recommendedTimeoutMs) + " ms.");
   }
 
   healthLevel = (overallSev >= SEV_WARN) ? overallSev : (uint8_t)SEV_OK;
@@ -652,6 +779,7 @@ String modeText(uint8_t m) {
 
 // ===================== Shared page chrome =====================
 const char PAGE_CSS[] PROGMEM = R"rawliteral(
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 body { font-family: Arial; background:#f5f7fa; margin:15px; }
@@ -681,6 +809,8 @@ input[type=text], input[type=password], input[type=number] { width:220px; max-wi
 .f-FAULT { border-color:#dc3545; } .f-WARN { border-color:#e0a800; } .f-INFO { border-color:#17a2b8; } .f-OK { border-color:#28a745; }
 .f .t { font-weight:bold; }
 .f .d { font-size:13px; color:#333; margin-top:3px; }
+.f ol { margin:4px 0 4px 18px; padding:0; } .f li { margin:2px 0; }
+.f button { padding:5px 10px; font-size:12px; }
 .r-OK { color:#155724; } .r-TIMEOUT, .r-CRCLENGTH, .r-FOREIGN, .r-NOTRTU { color:#dc3545; font-weight:bold; } .r-EXCEPTION, .r-WRONGID, .r-LATEREPLY, .r-BADFC { color:#b8860b; font-weight:bold; }
 .mono { font-family:monospace; font-size:12px; text-align:left; word-break:break-all; }
 .logbox { background:#111; color:#0f0; font-family:monospace; font-size:12px; padding:10px; max-height:220px; overflow-y:auto; border-radius:4px; }
@@ -794,12 +924,13 @@ const char DASHBOARD_BODY[] PROGMEM = R"rawliteral(
 <script>
 const $=id=>document.getElementById(id);
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+const ACT={scan:['Open Auto-scan',"location.href='/scan'"],reset:['Reset statistics (after fixing)','resetStats()'],settings:['Open Settings',"location.href='/settings'"]};
 function kv(label,val){return '<div class="kv">'+esc(label)+'<b>'+esc(val)+'</b></div>';}
 function ago(s){if(s<0)return '-';if(s<60)return s+' s';if(s<3600)return Math.floor(s/60)+' min';return Math.floor(s/3600)+' h';}
 function render(d){
   const h=$('health'); h.className='health h-'+d.health.level;
   h.textContent=({OK:'Bus healthy',WARN:'Warnings',FAULT:'Fault detected',IDLE:'Waiting for traffic'})[d.health.level]+'  ('+d.link.line+', '+d.link.mode+')';
-  $('findings').innerHTML=d.health.findings.map(f=>'<div class="f f-'+f.sev+'"><div class="t">['+f.sev+'] '+esc(f.title)+'</div><div class="d">'+f.detail+'</div></div>').join('');
+  $('findings').innerHTML=d.health.findings.map(f=>'<div class="f f-'+f.sev+'"><div class="t">['+f.sev+'] '+esc(f.title)+'</div><div class="d"><b>Likely cause:</b> '+esc(f.cause)+'</div>'+(f.remedy?'<div class="d"><b>'+(f.sev=='OK'?'Notes':'Remedy')+':</b><ol>'+f.remedy.split('\n').map(x=>'<li>'+esc(x)+'</li>').join('')+'</ol></div>':'')+(ACT[f.action]?'<button type="button" onclick="'+ACT[f.action][1]+'">'+ACT[f.action][0]+'</button>':'')+'</div>').join('');
   $('conn').textContent='Recommended master response timeout: '+d.recTimeoutMs+' ms';
   const L=d.link;
   $('link').innerHTML=kv('PC port',L.usbOpen?'Open':'Closed')+kv('Port settings',L.line+(L.fromHost?' (from PC)':' (default)'))+kv('Mode',L.mode)+kv('Bus idle level',L.idle)+kv('Last bus activity',L.lastActivityS<0?'never':ago(L.lastActivityS)+' ago')+kv('Diag reply timeout',L.diagTimeoutMs+' ms')+kv('WiFi AP',d.dev.ap+' / '+d.dev.apIp)+kv('Site WiFi',d.dev.sta)+kv('Uptime',ago(d.uptimeS))+kv('Free heap',d.heap+' B');
@@ -870,9 +1001,10 @@ void handleApiDiag() {
       if (findings[i].sev != sev) continue;
       if (!first) j += ",";
       first = false;
-      // detail may contain HTML entities (&Omega;) - title/detail are
-      // firmware-authored, user data inside is numbers / escaped text only.
-      j += "{\"sev\":\"" + String(sevName(sev)) + "\",\"title\":\"" + jsonEscape(findings[i].title) + "\",\"detail\":\"" + jsonEscape(findings[i].detail) + "\"}";
+      // Firmware-authored text; the page escapes it before display.
+      static const char *actions[] = { "", "scan", "reset", "settings" };
+      j += "{\"sev\":\"" + String(sevName(sev)) + "\",\"title\":\"" + jsonEscape(findings[i].title) + "\",\"cause\":\"" + jsonEscape(findings[i].cause);
+      j += "\",\"remedy\":\"" + jsonEscape(findings[i].remedy) + "\",\"action\":\"" + String(actions[findings[i].action < 4 ? findings[i].action : 0]) + "\"}";
     }
   }
   j += "]},\"recTimeoutMs\":" + String(recommendedTimeoutMs);

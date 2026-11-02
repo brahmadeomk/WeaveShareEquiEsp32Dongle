@@ -152,10 +152,15 @@ struct ScanStatus {
 // ===================== Diagnosis (web side) =====================
 #define MAX_FINDINGS 24
 
+// Action button offered next to a finding's remedy on the web page.
+enum FindingAction : uint8_t { ACT_NONE = 0, ACT_SCAN, ACT_RESET, ACT_SETTINGS };
+
 struct Finding {
-  uint8_t sev;  // Severity
+  uint8_t sev;     // Severity
+  uint8_t action;  // FindingAction
   String title;
-  String detail;
+  String cause;    // what is most likely wrong
+  String remedy;   // numbered steps, one per line ('\n' separated)
 };
 
 // ===================== SHA-256 (web login) =====================
