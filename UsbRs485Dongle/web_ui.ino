@@ -458,7 +458,7 @@ const char *sevName(uint8_t s) {
 
 #define STEPS_BIAS \
   "Add fail-safe bias at ONE point on the bus (usually at the master end): 330 \u03A9 from A (D+) to +5 V and 330 \u03A9 from B (D-) to GND.\n" \
-  "With the bus idle, measure A to B with a multimeter: it should read about +0.7 V. Near 0 V = bias missing, negative = A/B swapped.\n" \
+  "With the bus idle, measure A to B with a multimeter: +0.3 to +0.8 V is acceptable (typically about +0.7 V). +0.2 to +0.3 V is marginal, below +0.2 V = bias missing, negative = A/B swapped, above +1 V = termination missing.\n" \
   "Check whether a device already has switchable bias/termination (DIP switch) - enable it on one device only.\n" \
   "Press Reset statistics and check that the idle level reads HIGH."
 
@@ -567,7 +567,7 @@ void runDiagnosis() {
     addFinding(SEV_WARN, "Line held LOW (" + String(snapG.uartBreaks) + " break event(s))",
                "The bus was held at 0 for longer than a character: a swapped pair, a short, or a device whose transmitter stays on.",
                "Check A/B polarity at every device.\n"
-               "Measure A to B with a multimeter while the bus is idle: about +0.7 V is correct (330 \u03A9 bias). Below +0.2 V the receivers cannot tell idle from data; near 0 V means no bias; negative means A/B swapped or a device driving the bus.\n"
+               "Measure A to B with a multimeter while the bus is idle: +0.3 to +0.8 V is acceptable with the 330 \u03A9 bias (typically about +0.7 V). Below +0.2 V the receivers cannot tell idle from data; near 0 V means no bias; negative means A/B swapped or a device driving the bus.\n"
                "Disconnect devices one at a time to find one that holds the bus.\n"
                "Press Reset statistics and watch whether break events return.", ACT_RESET);
   }

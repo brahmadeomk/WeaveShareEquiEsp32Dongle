@@ -35,7 +35,7 @@ RS485 handling as the Gateway firmware.
 | Termination, dongle end | **120 Ω fitted on the dongle board.** Nothing to add at this end |
 | Termination, sensor end | **120 Ω across A-B at the last device at the far end of the cable.** Fit a resistor or switch on the device's termination DIP switch. **Check this on every installation** |
 | Termination elsewhere | None. Devices in the middle of the cable must have termination switched off |
-| Expected idle voltage A-B (bus powered, no traffic) | **about +0.7 V** |
+| Idle voltage A-B (bus powered, no traffic) | **Acceptable +0.3 V to +0.8 V** (measured about +0.7 V on our setup) |
 
 **Check the sensor-end termination** with everything powered off, by measuring
 the resistance between A and B at the dongle. The 330 Ω bias resistors make
@@ -51,12 +51,13 @@ Measure the idle voltage with a multimeter, red lead on A and black lead on B:
 
 | Reading | Meaning |
 |---|---|
-| About +0.7 V | Correct: bias and termination as specified |
-| Between +0.2 V and about +0.5 V | Check that 120 Ω is fitted only at the dongle and the sensor end (resistance check above), and that bias is fitted at one point only |
-| Below +0.2 V, or near 0 V | Bias missing or not powered. RS485 receivers can't tell idle from data below +0.2 V |
-| Negative (about -0.7 V) | A and B swapped |
+| Above about +1 V | **Termination missing.** Check the sensor-end 120 Ω (resistance check above) and that the dongle's on-board 120 Ω is connected |
+| **+0.3 V to +0.8 V** | **Acceptable.** Bias and termination are fine. The exact value depends on the supply and on how many terminators are fitted (about +0.7 V measured on our setup) |
+| +0.2 V to +0.3 V | **Marginal.** It still works, but there's little noise margin. Check that 120 Ω is fitted only at the dongle and the sensor end, and that bias is fitted at one point only |
+| Below +0.2 V, or near 0 V | **Fault: bias missing or not powered.** RS485 receivers can't tell idle from data below +0.2 V |
+| Negative (about -0.3 V to -0.8 V) | **Fault: A and B swapped** |
 
-The diagnostics page checks the same thing from the receiver side. *Bus idle level: HIGH* matches about +0.7 V; LOW matches a negative reading or missing bias.
+The diagnostics page checks the same thing from the receiver side. *Bus idle level: HIGH* matches a reading in the acceptable range; LOW matches a negative reading or missing bias.
 
 ## Converter features
 
@@ -138,9 +139,9 @@ their raw request and reply bytes in hex.
 
   | Finding | Likely cause | Remedy (summary) |
   |---|---|---|
-  | **RS485 bus idles LOW** (FAULT) | A/B swapped, or no fail-safe bias | Swap A/B at the dongle. If it's still LOW with the bus connected, add 330 Ω bias (A to +5 V, B to GND) at one point, or enable one device's bias switch. Idle A-B should then read about **+0.7 V** |
-  | **Idle line level unstable** (WARN) | Floating bus picks up noise | Add 330 Ω bias at one point (idle A-B about +0.7 V), check the 120 Ω at the **sensor end** (the dongle end is built in), shielded twisted pair |
-  | **Line held LOW / break events** (WARN) | Swapped pair, short, or a transmitter stuck on | Check polarity, measure the A-B idle voltage (about **+0.7 V** is correct; below +0.2 V is a fault, negative means swapped), disconnect devices one at a time |
+  | **RS485 bus idles LOW** (FAULT) | A/B swapped, or no fail-safe bias | Swap A/B at the dongle. If it's still LOW with the bus connected, add 330 Ω bias (A to +5 V, B to GND) at one point, or enable one device's bias switch. Idle A-B should then read **+0.3 to +0.8 V** |
+  | **Idle line level unstable** (WARN) | Floating bus picks up noise | Add 330 Ω bias at one point (idle A-B +0.3 to +0.8 V), check the 120 Ω at the **sensor end** (the dongle end is built in), shielded twisted pair |
+  | **Line held LOW / break events** (WARN) | Swapped pair, short, or a transmitter stuck on | Check polarity, measure the A-B idle voltage (**+0.3 to +0.8 V** is acceptable; below +0.2 V is a fault, negative means swapped), disconnect devices one at a time |
   | **Slave N never answers** (FAULT) | Device off, wrong ID, wrong settings, or wiring | Power and LED, ID, baud/parity/stop, A/B and GND, port enabled as Modbus RTU slave; *Open Auto-scan* if unknown |
   | **Every reply is corrupted** (FAULT) | Baud/parity/stop-bit mismatch | Match the master to the device's settings exactly, or find them with Auto-scan; if they match, treat it as noise |
   | **A different device answers** (FAULT) | Device configured with another ID | The first reply byte in *Recent transactions* is the real ID: poll that ID or readdress the device |
@@ -156,7 +157,7 @@ their raw request and reply bytes in hex.
   | **Exception 0A/0B** (WARN) | Gateway can't route / target silent | Gateway unit-ID mapping, downstream device power and link, longer timeout |
   | **Slow responder** (INFO) | Device takes > 200 ms | Master timeout at least the recommended value, poll interval above it |
   | **Another device is talking on the bus** (WARN) | A second master is polling | Find it from the FOREIGN rows, stop or disconnect it, or use a separate segment |
-  | **Stray byte in front of replies** (WARN) | Transceiver switching without bias | Add 330 Ω fail-safe bias at one point, then check idle A-B is about +0.7 V |
+  | **Stray byte in front of replies** (WARN) | Transceiver switching without bias | Add 330 Ω fail-safe bias at one point, then check idle A-B is +0.3 to +0.8 V |
   | **Noise between frames** (WARN) | Noise, or a device at another baud rate | Noise checklist, then Auto-scan for a mismatched device |
   | **UART framing/parity errors** (WARN) | Settings mismatch or distorted signal | Settings checklist if a device never answers, otherwise the noise checklist |
   | **Data overflow** (WARN) | PC not reading the port fast enough | Close other programs on the port, don't burst requests, another USB port/cable |
