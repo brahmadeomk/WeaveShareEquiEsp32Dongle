@@ -8,7 +8,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SKETCH="$HERE/../../UsbRs485Dongle"
 OUT=$(mktemp -d)
 cd "$OUT"
-python3 -I "$HERE/build.py" "$SKETCH"
+# --no-protos: no auto-generated prototypes, so a missing declaration fails
+# here exactly as it can in the Arduino IDE.
+python3 -I "$HERE/build.py" "$SKETCH" --no-protos
 g++ -std=gnu++17 -fsyntax-only -Wall -Wextra -Wno-unused-parameter -I "$HERE/stubs" -I "$SKETCH" sketch.cpp
 cp "$HERE/test.cpp" .
 g++ -std=gnu++17 -include vector -I "$HERE/stubs" -I "$SKETCH" test.cpp "$HERE/stubs.cpp" -o host_test

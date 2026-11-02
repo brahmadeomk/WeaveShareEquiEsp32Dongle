@@ -215,3 +215,17 @@ struct Sha256Ctx {
   uint64_t bitlen;
   uint32_t state[8];
 };
+
+// ===================== Cross-tab function declarations =====================
+// The Arduino IDE concatenates UsbRs485Dongle.ino first, then the other tabs
+// (web_ui.ino), and normally inserts prototypes automatically - but that
+// step is not reliable for every IDE/core version. Functions defined in
+// web_ui.ino and called from UsbRs485Dongle.ino are therefore declared here
+// explicitly, so the sketch never depends on generated prototypes.
+// (tests/host/run.sh compiles with generated prototypes switched off to
+// keep it that way.)
+void loadAllConfig();
+void setupWeb();
+void webTask(void *arg);
+void consoleBanner();
+void consoleProcess();

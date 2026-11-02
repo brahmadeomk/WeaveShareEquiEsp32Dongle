@@ -17,6 +17,7 @@ for i, l in enumerate(lines):
     if m and m.group(2) not in ('if','for','while','switch'):
         if first is None: first = i
         protos.append(l[:l.rindex(')')+1] + ';')
-lines[first:first] = protos
+if '--no-protos' not in sys.argv:
+    lines[first:first] = protos
 open('sketch.cpp','w').write('\n'.join(lines))
 print(len(protos), 'prototypes')
