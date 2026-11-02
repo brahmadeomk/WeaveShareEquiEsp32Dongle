@@ -53,14 +53,14 @@ def main() -> int:
     ok = 0
 
     for i in range(a.repeat):
+        if i and a.interval:
+            time.sleep(a.interval)  # pause between polls, like a real master
         ser.reset_input_buffer()
         t0 = time.perf_counter()
         ser.write(req)
         rx = ser.read(expected)
         dt = (time.perf_counter() - t0) * 1000
 
-        if i and a.interval:
-            time.sleep(a.interval)
         lines = [f"[{i + 1}] TX {req.hex(' ')}", f"    RX {rx.hex(' ') or '(nothing)'}  ({dt:.1f} ms)"]
 
         if len(rx) == 5 and rx[1] & 0x80:
