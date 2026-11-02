@@ -94,6 +94,9 @@ pip install pyserial
 python tools/modbus_rtu_test.py COM5 --baud 9600 --parity N --slave 1 --fc 3 --addr 0 --count 2 --repeat 10
 ```
 
+The full bench test procedure, with the pass criteria and a results sheet, is in
+[`docs/BENCH_TEST.md`](docs/BENCH_TEST.md).
+
 If you get no response, check these first: A/B swapped, the slave ID, the baud
 rate and parity, and the 120 Ω termination at the ends of a long bus.
 
