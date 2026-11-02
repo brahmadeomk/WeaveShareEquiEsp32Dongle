@@ -69,6 +69,8 @@ Logic analyser (T6): CH1 = **D3 (TX)**, CH2 = **D4 (DE/RE)**, CH3 = **D2 (RX)**,
 | P1 | Visual: transceiver, A/B screw terminals, no solder bridges near D2–D4 | OK |
 | P2 | Relay/DO loads (D11, D12, D13, A4) connected as in the field, or disconnected | Recorded |
 | P3 | Modem board (if fitted) | Either state is fine; the firmware won't pulse PWRKEY |
+| P4 | Bias resistors: **330 Ω** A to +5 V and **330 Ω** B to GND, fitted at one point on the bus only. 120 Ω termination at the two cable ends only | Fitted as specified |
+| P5 | **After power-on, with no traffic:** measure A to B with a multimeter (red lead on A, black lead on B) | **About +0.7 V.** Below +0.2 V means bias missing; negative means A/B swapped; +0.2 to +0.5 V means extra bias or termination somewhere. Record the reading: ______ V |
 
 ---
 
@@ -213,7 +215,8 @@ finding clears.
 | **D2 Wrong slave ID** | Poll `--slave 77` (no such device) | **Slave 77 never answers** (FAULT), with the wiring/ID/settings checklist |
 | **D3 Wrong baud rate** | Slave at 19200, master opens at 9600 | **Slave N never answers** or **every reply is corrupted** (FAULT), mentioning baud/parity mismatch. Usually also **UART framing/parity errors** (WARN) |
 | **D4 Wrong parity** | Slave at 9600 E1, master at 9600 N1 | As D3. The finding names the PC's port settings (`9600 8N1`) |
-| **D5 A/B swapped** | Swap the A and B wires (bus with bias resistors) | **RS485 bus idles LOW** (FAULT) within about 3 s of the bus going quiet. Polls fail. Restore the wiring: the idle level goes back to HIGH (Reset statistics to clear old findings) |
+| **D5 A/B swapped** | Swap the A and B wires at the dongle (bus with 330 Ω bias) | A-B at the dongle reads about **-0.7 V**. **RS485 bus idles LOW** (FAULT) within about 3 s of the bus going quiet. Polls fail. Restore the wiring: A-B reads about +0.7 V again and the idle level goes back to HIGH (Reset statistics to clear old findings) |
+| **D5b Bias removed** (optional) | Disconnect the 330 Ω bias resistors | A-B reads near 0 V. **Idle line level unstable** or **RS485 bus idles LOW**, sometimes with **Stray byte in front of replies**. Refit the bias: A-B reads about +0.7 V again |
 | **D6 Device stops** | Poll continuously (`--repeat 200`), then power off the slave halfway | **Slave N stopped responding** (FAULT), showing how many requests succeeded first |
 | **D7 Illegal address** | `--addr 9999` (or any register the device doesn't have) | **Illegal data address (exception 02)** (WARN), with the 0-based / 4xxxx numbering hint |
 | **D8 Unsupported function** | Poll with a function code the device lacks (e.g. FC04 on a holding-register-only device) | **Function not supported (exception 01)** (WARN) |
@@ -261,6 +264,7 @@ Stop the Modbus master software before each scan (closing the COM port is enough
 
 | Test | Result (Pass / Fail / N/A) | Notes / measured values |
 |---|---|---|
+| P5 Idle A-B voltage | | V: |
 | T1 Flash | | |
 | T2 Boot | | |
 | T3 Enumeration | | Port name: |
@@ -308,6 +312,7 @@ Stop the Modbus master software before each scan (closing the COM port is enough
 | Fails only at low baud with "first byte missing" | Check T6b. DE must drop right after the last stop bit |
 | Fails only at high baud | Cable length or termination, or the transceiver's rated speed (MAX485 ≈ 2.5 Mbps max, some clones much lower) |
 | CRC errors that come and go under load (R1/R2) | Termination or biasing missing, ground loop, or noisy cable. Retest with a short bench cable |
+| Idle level LOW or UNSTABLE on the page | Measure A-B at idle: it should be about +0.7 V with the 330 Ω bias. Negative means A/B swapped; near 0 V means the bias is missing or unpowered |
 | Web page doesn't open | Check you are connected to the **ModbusDongle** WiFi and browsing to `http://192.168.4.1` (not https). Mobile phones may drop a WiFi network that has no internet access: turn off mobile data or tell the phone to stay connected |
 | Forgot the web or AP password | Open the COM port at **74880** baud and send `factory-reset-auth` (W12) |
 | Findings from an earlier fault still shown | Counters are cumulative: press **Reset statistics** after fixing a fault |

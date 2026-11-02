@@ -27,6 +27,25 @@ RS485 handling as the Gateway firmware.
 | WiFi | Onboard | Access Point for the diagnostics page, plus optional site WiFi |
 | USB-C | — | PC link (USB CDC) |
 
+### RS485 bus bias and termination
+
+| Item | Value |
+|---|---|
+| Fail-safe bias (at **one** point on the bus) | **330 Ω** from A (D+) to +5 V, and **330 Ω** from B (D-) to GND |
+| Termination | 120 Ω across A-B at the two physical ends of the cable only |
+| Expected idle voltage A-B (bus powered, no traffic) | **about +0.7 V** |
+
+Measure the idle voltage with a multimeter, red lead on A and black lead on B:
+
+| Reading | Meaning |
+|---|---|
+| About +0.7 V | Correct: bias and termination as specified |
+| Between +0.2 V and about +0.5 V | Extra bias or termination somewhere: check that only one point has bias and only the two ends have 120 Ω |
+| Below +0.2 V, or near 0 V | Bias missing or not powered. RS485 receivers can't tell idle from data below +0.2 V |
+| Negative (about -0.7 V) | A and B swapped |
+
+The diagnostics page checks the same thing from the receiver side. *Bus idle level: HIGH* matches about +0.7 V; LOW matches a negative reading or missing bias.
+
 ## Converter features
 
 - **Follows the host's port settings.** The baud rate, data bits (5–8), parity
@@ -107,9 +126,9 @@ their raw request and reply bytes in hex.
 
   | Finding | Likely cause | Remedy (summary) |
   |---|---|---|
-  | **RS485 bus idles LOW** (FAULT) | A/B swapped, or no fail-safe bias | Swap A/B at the dongle. If it's still LOW with the bus connected, add about 680 Ω bias (A to +5 V, B to GND) at one point, or enable one device's bias switch |
-  | **Idle line level unstable** (WARN) | Floating bus picks up noise | Add bias at one point, 120 Ω termination at both ends, shielded twisted pair |
-  | **Line held LOW / break events** (WARN) | Swapped pair, short, or a transmitter stuck on | Check polarity, measure A-B idle voltage (+0.2 V or more is good), disconnect devices one at a time |
+  | **RS485 bus idles LOW** (FAULT) | A/B swapped, or no fail-safe bias | Swap A/B at the dongle. If it's still LOW with the bus connected, add 330 Ω bias (A to +5 V, B to GND) at one point, or enable one device's bias switch. Idle A-B should then read about **+0.7 V** |
+  | **Idle line level unstable** (WARN) | Floating bus picks up noise | Add 330 Ω bias at one point (idle A-B about +0.7 V), 120 Ω termination at both ends, shielded twisted pair |
+  | **Line held LOW / break events** (WARN) | Swapped pair, short, or a transmitter stuck on | Check polarity, measure the A-B idle voltage (about **+0.7 V** is correct; below +0.2 V is a fault, negative means swapped), disconnect devices one at a time |
   | **Slave N never answers** (FAULT) | Device off, wrong ID, wrong settings, or wiring | Power and LED, ID, baud/parity/stop, A/B and GND, port enabled as Modbus RTU slave; *Open Auto-scan* if unknown |
   | **Every reply is corrupted** (FAULT) | Baud/parity/stop-bit mismatch | Match the master to the device's settings exactly, or find them with Auto-scan; if they match, treat it as noise |
   | **A different device answers** (FAULT) | Device configured with another ID | The first reply byte in *Recent transactions* is the real ID: poll that ID or readdress the device |
@@ -125,7 +144,7 @@ their raw request and reply bytes in hex.
   | **Exception 0A/0B** (WARN) | Gateway can't route / target silent | Gateway unit-ID mapping, downstream device power and link, longer timeout |
   | **Slow responder** (INFO) | Device takes > 200 ms | Master timeout at least the recommended value, poll interval above it |
   | **Another device is talking on the bus** (WARN) | A second master is polling | Find it from the FOREIGN rows, stop or disconnect it, or use a separate segment |
-  | **Stray byte in front of replies** (WARN) | Transceiver switching without bias | Add fail-safe bias at one point |
+  | **Stray byte in front of replies** (WARN) | Transceiver switching without bias | Add 330 Ω fail-safe bias at one point, then check idle A-B is about +0.7 V |
   | **Noise between frames** (WARN) | Noise, or a device at another baud rate | Noise checklist, then Auto-scan for a mismatched device |
   | **UART framing/parity errors** (WARN) | Settings mismatch or distorted signal | Settings checklist if a device never answers, otherwise the noise checklist |
   | **Data overflow** (WARN) | PC not reading the port fast enough | Close other programs on the port, don't burst requests, another USB port/cable |
