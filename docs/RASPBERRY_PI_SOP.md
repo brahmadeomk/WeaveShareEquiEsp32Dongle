@@ -6,6 +6,9 @@ auto-scan, the sniffer and credential recovery, all from a Pi terminal. Each
 step names the matching test ID in [`BENCH_TEST.md`](BENCH_TEST.md) so you can
 fill in its results sheet.
 
+> **Just need to know if a dongle is OK?** Run `python3 tools/quick_test.py` (see
+> [`QUICK_TEST.md`](QUICK_TEST.md)). This SOP is the full step-by-step procedure.
+
 | Item | Value |
 |---|---|
 | Applies to | `UsbRs485Dongle` firmware v1.2 or later, Arduino Nano ESP32 on the Gateway board |

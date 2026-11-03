@@ -121,30 +121,16 @@ def hexs(b: bytes) -> str:
     return b.hex(" ").upper()
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("port")
-    ap.add_argument("--baud", type=int, default=9600)
-    ap.add_argument("--parity", choices="NEO", default="N")
-    ap.add_argument("--stop", type=int, choices=(1, 2), default=1)
-    ap.add_argument("--slave", type=int, action="append", help="slave ID to simulate (repeatable, default 1)")
-    ap.add_argument("--regs", type=int, default=100, help="registers/coils per slave (default 100)")
-    ap.add_argument("--delay", type=float, default=0.0, help="extra reply delay in ms (simulate a slow device)")
-    ap.add_argument("--quiet", action="store_true", help="don't print every frame")
-    a = ap.parse_args()
-
-    ids = a.slave or [1]
-    slaves = {sid: Slave(a.regs) for sid in ids}
-    ser = serial.Serial(a.port, a.baud, bytesize=8, parity=a.parity, stopbits=a.stop, timeout=0)
-    gap = max(0.020, 3.5 * 11 / a.baud)  # generous: USB adapters deliver bytes in bursts
-    print("Simulating slave ID(s) %s on %s at %d 8%s%d - Ctrl+C to stop" % (
-        ",".join(map(str, ids)), a.port, a.baud, a.parity, a.stop), flush=True)
-
+def serve(ser, slaves, stop=None, delay_ms=0.0, quiet=False, log=print):
+    """Answer Modbus RTU requests on an open serial port until stop is set
+    (a threading.Event) or Ctrl+C. Returns the number of requests answered.
+    Also used by quick_test.py, which runs the simulator in a thread."""
+    gap = max(0.020, 3.5 * 11 / ser.baudrate)  # generous: USB adapters deliver bytes in bursts
     buf = b""
     last = time.monotonic()
     served = 0
     try:
-        while True:
+        while stop is None or not stop.is_set():
             data = ser.read(256)
             now = time.monotonic()
             if data:
@@ -160,34 +146,57 @@ def main() -> int:
             frame = buf[:want] if complete else buf
             buf = buf[len(frame):]
             if not crc_ok(frame):
-                if not a.quiet:
-                    print("  ignored (bad CRC / not a frame): %s" % hexs(frame), flush=True)
+                if not quiet:
+                    log("  ignored (bad CRC / not a frame): %s" % hexs(frame))
                 continue
             sid = frame[0]
             if sid != 0 and sid not in slaves:
-                if not a.quiet:
-                    print("  not for us (ID %d): %s" % (sid, hexs(frame)), flush=True)
+                if not quiet:
+                    log("  not for us (ID %d): %s" % (sid, hexs(frame)))
                 continue
             targets = list(slaves.items()) if sid == 0 else [(sid, slaves[sid])]
             reply = None
             for tid, s in targets:
                 reply = s.handle(tid, frame[1:-2])
             if sid == 0:
-                if not a.quiet:
-                    print("RX %s  (broadcast, no reply)" % hexs(frame), flush=True)
+                if not quiet:
+                    log("RX %s  (broadcast, no reply)" % hexs(frame))
                 continue
             out = with_crc(reply)
-            if a.delay:
-                time.sleep(a.delay / 1000.0)
+            if delay_ms:
+                time.sleep(delay_ms / 1000.0)
             ser.write(out)
             ser.flush()
             served += 1
-            if not a.quiet:
-                print("RX %s  ->  TX %s" % (hexs(frame), hexs(out)), flush=True)
+            if not quiet:
+                log("RX %s  ->  TX %s" % (hexs(frame), hexs(out)))
             elif served % 100 == 0:
-                print("%d requests served" % served, flush=True)
+                log("%d requests served" % served)
     except KeyboardInterrupt:
-        print("\n%d request(s) served" % served)
+        if stop is not None:
+            raise
+    return served
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("port")
+    ap.add_argument("--baud", type=int, default=9600)
+    ap.add_argument("--parity", choices="NEO", default="N")
+    ap.add_argument("--stop", type=int, choices=(1, 2), default=1)
+    ap.add_argument("--slave", type=int, action="append", help="slave ID to simulate (repeatable, default 1)")
+    ap.add_argument("--regs", type=int, default=100, help="registers/coils per slave (default 100)")
+    ap.add_argument("--delay", type=float, default=0.0, help="extra reply delay in ms (simulate a slow device)")
+    ap.add_argument("--quiet", action="store_true", help="don't print every frame")
+    a = ap.parse_args()
+
+    ids = a.slave or [1]
+    slaves = {sid: Slave(a.regs) for sid in ids}
+    ser = serial.Serial(a.port, a.baud, bytesize=8, parity=a.parity, stopbits=a.stop, timeout=0)
+    print("Simulating slave ID(s) %s on %s at %d 8%s%d - Ctrl+C to stop" % (
+        ",".join(map(str, ids)), a.port, a.baud, a.parity, a.stop), flush=True)
+    served = serve(ser, slaves, delay_ms=a.delay, quiet=a.quiet, log=lambda m: print(m, flush=True))
+    print("\n%d request(s) served" % served)
     return 0
 
 

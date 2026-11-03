@@ -1,8 +1,11 @@
+> **Technicians:** use the short [`QUICK_TEST.md`](QUICK_TEST.md) instead. This document is
+> the full engineering procedure.
+
 # Bench Test Procedure: USB ⇄ RS485 Dongle (Arduino Nano ESP32)
 
 This procedure checks the `UsbRs485Dongle` firmware (v1.2: converter + WiFi diagnostics + auto-scan + sniffer) on the Gateway board hardware
 before it's used in the field. Run the tests in order, because later tests assume
-the earlier ones passed. Record the results in the table in §9.
+the earlier ones passed. Record the results in the table in §13.
 
 Testing from a Raspberry Pi? Follow [`RASPBERRY_PI_SOP.md`](RASPBERRY_PI_SOP.md):
 it carries out these tests step by step from a Pi terminal.

@@ -16,6 +16,10 @@ and **sniff** (listen only) a bus that another master is already running.
 The hardware doesn't change. The firmware uses the same pins and the same
 RS485 handling as the Gateway firmware.
 
+> **Testing a dongle?** Start with [`docs/QUICK_TEST.md`](docs/QUICK_TEST.md): one command
+> (`python tools/quick_test.py`) runs the tests and prints PASS/FAIL, then 4 short checks
+> by hand. About 15 minutes per dongle.
+
 ## Hardware (same as the Gateway)
 
 | Function | Pin(s) | Used by the dongle |
@@ -393,6 +397,7 @@ these tools:
 
 | Tool | Purpose |
 |---|---|
+| `tools/quick_test.py` | **One-command test**: finds the ports, runs the converter tests, prints PASS/FAIL with what to do, saves a report (see `docs/QUICK_TEST.md`) |
 | `tools/modbus_rtu_test.py` | Modbus master: read registers through the dongle (`--repeat`, `--interval`, `--quiet` for soak tests) |
 | `tools/modbus_slave_sim.py` | Modbus RTU slave simulator for a second USB-RS485 adapter (pyserial only) |
 | `tools/dongle_cli.py` | Diagnosis (findings + remedies + slave table), auto-scan and sniffer from the command line, over WiFi (standard library only) | It includes deliberate fault tests,
