@@ -89,7 +89,7 @@ Logic analyser (T6): CH1 = **D3 (TX)**, CH2 = **D4 (DE/RE)**, CH3 = **D2 (RX)**,
 | Test | Steps | Pass criterion |
 |---|---|---|
 | **T1 Flash** | Arduino IDE: Board = *Arduino Nano ESP32*, USB Mode = default, Core Debug Level = **None** → Upload `UsbRs485Dongle.ino` | Compiles with no errors and uploads |
-| **T2 Boot** | Unplug, then replug USB | RGB LED shows a short **white flash**, then stays off |
+| **T2 Boot** | Unplug, then replug USB | The LED shows **red → green → blue** once (about 1 s), then a short **green** blink every 2 s |
 | **T3 Enumeration** | Windows: Device Manager → Ports. Linux: `ls /dev/ttyACM*`. macOS: `ls /dev/cu.usbmodem*` | One new COM/ttyACM port appears |
 | **T4 Safe outputs** | Measure D11, D12, D13, A4 to GND; watch the relays during boot | All about 0 V. No relay clicks at any point during boot |
 | **T5 Quiet port** | Open the port at 9600 in a serial terminal and send nothing for 10 s | **No bytes** are received (no boot text or debug output) |
@@ -103,7 +103,7 @@ port. Each run prints `n/n OK` when it passes.
 
 | Test | Command / steps | Pass criterion |
 |---|---|---|
-| **F1 Read holding (FC3)** | `python tools/modbus_rtu_test.py COM5 --baud 9600 --slave 1 --fc 3 --addr 0 --count 2 --repeat 10` | `10/10 OK`. Values match the slave (simulator: `[0, 1]`). **Blue** LED flash, then **green** |
+| **F1 Read holding (FC3)** | `python tools/modbus_rtu_test.py COM5 --baud 9600 --slave 1 --fc 3 --addr 0 --count 2 --repeat 10` | `10/10 OK`. Values match the slave (simulator: `[0, 1]`). The LED flickers **blue/green** while polling |
 | **F2 Read input (FC4)** | `... --fc 4 --addr 0 --count 4 --repeat 10` | `10/10 OK` (simulator: `[1000..1003]`) |
 | **F3 Exception** | `... --fc 3 --addr 9999 --count 1` | Prints `slave exception code 2` (illegal address). The DUT passes the exception through unchanged |
 | **F4 Wrong slave ID** | `... --slave 77` | `BAD/NO RESPONSE` after a 1 s timeout. The next F1 run passes again straight away |
@@ -146,7 +146,7 @@ port open.
 
 **L-note (1200 baud):** with `ALLOW_1200BAUD_REBOOT 1` (the default), opening the
 port at 1200 baud reboots the board into the bootloader. **Expected result:** the
-COM port disappears or re-enumerates, and you see the white boot flash after you
+COM port disappears or re-enumerates, and you see the red → green → blue start-up sequence after you
 re-flash or power-cycle. Record "rebooted as designed". To test real 1200-baud
 traffic, rebuild with `ALLOW_1200BAUD_REBOOT 0` and run
 `--baud 1200 --timeout 2 --repeat 10`.
@@ -280,16 +280,20 @@ pair. **The dongle's own COM port doesn't need to be open.**
 
 ## 12. LED behaviour
 
+Only one colour shows at a time. To see the send/receive flashes clearly, poll
+slowly, once a second, with `--interval 1`.
+
 | Test | Condition | Expected LED |
 |---|---|---|
-| **E1** | Power-up | Short white flash |
-| **E2** | F1 running | Blue flash (TX), then green flash (RX) on each poll |
-| **E3** | Slave disconnected, F1 running | Blue flashes only |
+| **E1** | Power-up (unplug and replug USB) | **Red → green → blue**, once, about 0.3 s each. If one colour is missing, the LED or that pin is faulty |
+| **E1b** | Idle after power-up, no faults | Short **green** blink every 2 s (heartbeat) |
+| **E2** | `python tools/modbus_rtu_test.py COM5 --repeat 10 --interval 1` | Once a second: a **blue** flash (request sent), immediately followed by a **green** flash (reply) |
+| **E3** | As E2 with the slave disconnected | **Blue** flashes only, no green |
 | **E4** | Open the port with **mark** parity (e.g. pyserial `parity='M'`) | Red flash about 0.5 s. Traffic continues with no parity |
-| **E5** | Diagnosis verdict FAULT (e.g. D2), bus quiet | Red blink every 2 s |
-| **E6** | Diagnosis verdict WARN (e.g. D7), bus quiet | Yellow blink every 2 s |
-| **E7** | Auto-scan running | Purple blink every 1 s, plus blue/green flashes per probe |
-| **E8** | Sniffer running | Cyan blink every 1 s, plus a green flash per received frame. Never blue (no transmit) |
+| **E5** | Diagnosis verdict FAULT (e.g. D2), bus quiet | **Red** blink every 2 s instead of green. Note: the quick test causes faults on purpose, so it ends with a red blink. Press **Reset statistics** on the web page and the blink turns green again within 2 s |
+| **E6** | Diagnosis verdict WARN (e.g. D7), bus quiet | **Yellow** blink every 2 s |
+| **E7** | Auto-scan running | **Purple** blink every 1 s, plus a blue flash per probe (and green when a device answers) |
+| **E8** | Sniffer running | **Cyan** blink every 1 s, plus a green flash per received frame. **Never blue** (the dongle doesn't transmit) |
 
 ---
 
@@ -343,6 +347,7 @@ pair. **The dongle's own COM port doesn't need to be open.**
 |---|---|
 | Sketch doesn't compile: *"Select the Arduino Nano ESP32 with its default USB mode"* | **Tools → USB Mode** is set to Debug/Hardware CDC. Change it back to the default |
 | Garbage or text appears on the port with no traffic (T5 fails) | Core Debug Level isn't **None**. Rebuild with it set to None |
+| LED stays completely dark, even at power-up | Firmware 1.2.0 or older: a bug compiled the LED code out. Flash v1.2.1 or newer (Settings page → Firmware). If it's still dark, the board's RGB LED is faulty |
 | Every request times out, but the blue LED flashes | A/B swapped, slave ID/baud/parity mismatch, missing GND reference, or DE/RE (D4) not wired to the transceiver |
 | Fails only at low baud with "first byte missing" | Check T6b. DE must drop right after the last stop bit |
 | Fails only at high baud | Cable length, or the sensor-end 120 Ω termination missing (check P4b), or the transceiver's rated speed (MAX485 ≈ 2.5 Mbps max, some clones much lower) |

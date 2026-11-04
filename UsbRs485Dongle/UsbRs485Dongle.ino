@@ -79,7 +79,7 @@
 #error "Select the Arduino Nano ESP32 with its default USB mode (TinyUSB CDC on boot). Hardware-CDC/debug mode cannot follow the host's baud/parity."
 #endif
 
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.2.1"
 
 // ===================== Pins (same as Gateway board) =====================
 #define RXD2 D2
@@ -127,7 +127,7 @@ const uint8_t DO_PINS[] = { D11, D12, D13, A4 };
 #define CHUNK_SIZE 256
 #define FRAME_BUF_SIZE 260  // max RTU ADU is 256 bytes
 
-#define LED_FLASH_MS 25
+#define LED_FLASH_MS 60  // long enough to see each flash
 
 // ===================== Diagnostics defaults (overridable in Settings) =====================
 #define DEFAULT_DIAG_RESPONSE_TIMEOUT_MS 1000
@@ -267,52 +267,88 @@ void logKeyEvent(const char *fmt, ...) {
 }
 
 // ===================== Status LED (RGB, active LOW) =====================
-#if defined(LED_RED) && defined(LED_GREEN) && defined(LED_BLUE)
-#define HAS_RGB_LED 1
-#else
-#define HAS_RGB_LED 0
-#endif
+// Arduino Nano ESP32 onboard RGB LED, common anode: LOW = on.
+// The board package declares LED_RED / LED_GREEN / LED_BLUE as constexpr
+// constants, NOT #define macros - so they are used directly here. (Firmware
+// up to 1.2.0 tested "#if defined(LED_RED)", which is always false for a
+// constant, and the LED code was silently compiled out.)
+//
+// What the LED shows (one colour at a time):
+//   power-up             red -> green -> blue, once (self-test, ~1 s)
+//   blue flash           request sent on RS485
+//   green flash          reply received from RS485
+//   red flash (0.5 s)    USB overflow / mark-space parity requested
+//   purple blink 1 s     auto-scan running
+//   cyan blink 1 s       sniffer running
+//   idle, every 2 s:     green blink = OK, yellow = WARN, red = FAULT
+#define LED_OFF 0
+#define LED_R 1
+#define LED_G 2
+#define LED_B 4
 
 unsigned long ledTxUntil = 0, ledRxUntil = 0, ledErrUntil = 0;
+uint8_t ledLastActivity = LED_G;  // colour of the most recent TX/RX event
+
+void ledWrite(uint8_t rgb) {
+  digitalWrite(LED_RED, (rgb & LED_R) ? LOW : HIGH);
+  digitalWrite(LED_GREEN, (rgb & LED_G) ? LOW : HIGH);
+  digitalWrite(LED_BLUE, (rgb & LED_B) ? LOW : HIGH);
+}
 
 void ledInit() {
-#if HAS_RGB_LED
   pinMode(LED_RED, OUTPUT);
   pinMode(LED_GREEN, OUTPUT);
   pinMode(LED_BLUE, OUTPUT);
-  digitalWrite(LED_RED, HIGH);
-  digitalWrite(LED_GREEN, HIGH);
-  digitalWrite(LED_BLUE, HIGH);
-#endif
+  ledWrite(LED_OFF);
 }
 
-// Activity flashes win; otherwise the health verdict blinks once every
-// 2 s: red = FAULT, yellow (red+green) = WARN. Scan = slow purple.
+// Power-up self-test: proves all three colours work before anything else.
+void ledSelfTest() {
+  const uint8_t seq[] = { LED_R, LED_G, LED_B };
+  for (uint8_t c : seq) {
+    ledWrite(c);
+    delay(300);
+  }
+  ledWrite(LED_OFF);
+}
+
+void ledFlashTx() {
+  ledTxUntil = millis() + LED_FLASH_MS;
+  ledLastActivity = LED_B;
+}
+
+void ledFlashRx() {
+  ledRxUntil = millis() + LED_FLASH_MS;
+  ledLastActivity = LED_G;
+}
+
 void ledUpdate() {
-#if HAS_RGB_LED
   static uint8_t shown = 0xFF;
   unsigned long now = millis();
-  uint8_t want = ((long)(ledErrUntil - now) > 0 ? 1 : 0) |
-                 ((long)(ledRxUntil - now) > 0 ? 2 : 0) |
-                 ((long)(ledTxUntil - now) > 0 ? 4 : 0);
+  bool err = (long)(ledErrUntil - now) > 0;
+  bool tx = (long)(ledTxUntil - now) > 0;
+  bool rx = (long)(ledRxUntil - now) > 0;
+  uint8_t want = LED_OFF;
 
-  if (want == 0) {
-    if (bridgeMode == MODE_SCAN) {
-      if ((now % 1000) < 150) want = 1 | 4;  // purple
-    } else if (bridgeMode == MODE_SNIFF) {
-      if ((now % 1000) < 150) want = 2 | 4;  // cyan
-    } else if ((now % 2000) < 120) {
-      if (healthLevel == SEV_FAULT) want = 1;
-      else if (healthLevel == SEV_WARN) want = 1 | 2;
-    }
+  if (err) {
+    want = LED_R;
+  } else if (tx || rx) {
+    // Only one colour at a time: the most recent event wins, so fast polling
+    // shows a clear blue/green alternation instead of a mixed colour.
+    want = (tx && rx) ? ledLastActivity : (tx ? LED_B : LED_G);
+  } else if (bridgeMode == MODE_SCAN) {
+    if ((now % 1000) < 150) want = LED_R | LED_B;  // purple
+  } else if (bridgeMode == MODE_SNIFF) {
+    if ((now % 1000) < 150) want = LED_G | LED_B;  // cyan
+  } else if ((now % 2000) < 120) {
+    if (healthLevel == SEV_FAULT) want = LED_R;
+    else if (healthLevel == SEV_WARN) want = LED_R | LED_G;  // yellow
+    else want = LED_G;  // heartbeat: running, no problems
   }
 
   if (want == shown) return;
   shown = want;
-  digitalWrite(LED_RED, (want & 1) ? LOW : HIGH);
-  digitalWrite(LED_GREEN, (want & 2) ? LOW : HIGH);
-  digitalWrite(LED_BLUE, (want & 4) ? LOW : HIGH);
-#endif
+  ledWrite(want);
 }
 
 // ===================== RS485 Direction Control (from Gateway) =====================
@@ -797,7 +833,7 @@ bool pumpRs485ToUsb() {
   }
 
   lastBusActivityUs = micros();
-  ledRxUntil = millis() + LED_FLASH_MS;
+  ledFlashRx();
   return true;
 }
 
@@ -845,7 +881,7 @@ bool pumpUsbToRs485() {
   postTransmission();
   uint32_t now = micros();
   lastBusActivityUs = now;
-  ledTxUntil = millis() + LED_FLASH_MS;
+  ledFlashTx();
 
   analyzerOnRequest(now);
   return true;
@@ -969,7 +1005,7 @@ void scanStep() {
   Serial1.flush();
   postTransmission();
   uint32_t t0 = micros();
-  ledTxUntil = millis() + LED_FLASH_MS;
+  ledFlashTx();
 
   uint8_t rx[FRAME_BUF_SIZE];
   uint16_t n = 0;
@@ -1023,7 +1059,7 @@ void scanStep() {
 
   if (valid) {
     scanHitInCombo = true;
-    ledRxUntil = millis() + LED_FLASH_MS;
+    ledFlashRx();
   }
 
   scanId++;
@@ -1370,7 +1406,7 @@ void sniffStep() {
     segLastUs = now;
     segExpectMore = (got >= SNIFF_FIFO_FULL);  // FIFO-full delivery: frame continues
     lastBusActivityUs = now;
-    ledRxUntil = millis() + LED_FLASH_MS;
+    ledFlashRx();
   }
 
   if (segLen) {
@@ -1459,6 +1495,7 @@ void setup() {
   digitalWrite(MODEM_PWRKEY_PIN, HIGH);  // idle level: no power-key press
 
   ledInit();
+  ledSelfTest();  // red -> green -> blue once: the tester can see all three colours work
 
   // Serial (USB CDC) is started by the core before setup().
   Serial.setRxBufferSize(USB_RX_BUFFER_SIZE);
@@ -1496,8 +1533,6 @@ void setup() {
   xTaskCreatePinnedToCore(webTask, "WebTask", WEB_TASK_STACK, NULL,
                           WEB_TASK_PRIORITY, &webTaskHandle, WEB_TASK_CORE);
 
-  // Brief white flash = booted.
-  ledErrUntil = ledRxUntil = ledTxUntil = millis() + 200;
 }
 
 // Intentionally idle: all work runs in bridgeTask (Core 1) / webTask (Core 0).

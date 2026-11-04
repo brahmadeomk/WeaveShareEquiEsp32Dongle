@@ -90,14 +90,18 @@ The diagnostics page checks the same thing from the receiver side. *Bus idle lev
 
   | LED | Meaning |
   |---|---|
-  | White flash | Booted |
-  | Blue flash | PC → RS485 transmit |
-  | Green flash | RS485 → PC receive |
-  | Red blink every 2 s | Diagnosis verdict FAULT |
-  | Yellow blink every 2 s | Diagnosis verdict WARN |
-  | Purple blink every 1 s | Auto-scan running |
-  | Cyan blink every 1 s | Sniffer running (green flash per received frame) |
-  | Red flash | USB RX overflow, or mark/space parity requested (falls back to none) |
+  | **Red → green → blue**, once, at power-up (about 1 s) | Self-test: the dongle has started and all three colours work |
+  | Short **green** blink every 2 s | Running, no problems found (heartbeat) |
+  | Short **yellow** blink every 2 s | Warning: open the Diagnostics page |
+  | Short **red** blink every 2 s | Fault: open the Diagnostics page |
+  | **Blue** flash | A request was sent on RS485 |
+  | **Green** flash | A reply was received from RS485 |
+  | **Purple** blink every 1 s | Auto-scan running |
+  | **Cyan** blink every 1 s | Sniffer running (plus a green flash per frame; never blue) |
+  | **Red** flash, 0.5 s | USB overflow, or the PC asked for mark/space parity (falls back to none) |
+
+  Only one colour shows at a time. With fast polling, the blue and green
+  flashes alternate quickly, so it looks like a blue/green flicker.
 
 ## Diagnostics (WiFi page)
 
@@ -171,8 +175,8 @@ their raw request and reply bytes in hex.
 
 - **Recommended master response timeout:** worked out from the slowest reply
   seen (2 × the worst latency + 20 ms, at least 100 ms).
-- **LED verdict:** red blink = FAULT, yellow blink = WARN (every 2 s, when the
-  bus is quiet).
+- **LED verdict:** every 2 s when the bus is quiet: green blink = OK, yellow =
+  WARN, red = FAULT.
 
 ### 3. Auto-scan
 Auto-scan finds devices when you don't know their slave ID, baud rate or

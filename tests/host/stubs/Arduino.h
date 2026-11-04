@@ -40,9 +40,12 @@ void pinMode(uint8_t,uint8_t); void digitalWrite(uint8_t,uint8_t);
 #define LOW 0
 #define OUTPUT 3
 enum { D2=2,D3,D4,D5,D6,D7,D8,D9,D10,D11,D12,D13, A0=20,A1,A2,A3,A4,A5 };
-#define LED_RED 46
-#define LED_GREEN 0
-#define LED_BLUE 45
+// Same style as the real Nano ESP32 variant (pins_arduino.h): constexpr
+// constants, NOT macros - so "#if defined(LED_RED)" is false here too.
+static constexpr uint8_t LED_RED = 14;
+static constexpr uint8_t LED_GREEN = 15;
+static constexpr uint8_t LED_BLUE = 16;
+extern uint8_t g_pinLevel[64];   // last digitalWrite() value per pin (tests)
 #define ARDUINO_USB_CDC_ON_BOOT 1
 #define ARDUINO_USB_MODE 0
 enum { SERIAL_5N1,SERIAL_5N2,SERIAL_5O1,SERIAL_5O2,SERIAL_5E1,SERIAL_5E2,SERIAL_6N1,SERIAL_6N2,SERIAL_6O1,SERIAL_6O2,SERIAL_6E1,SERIAL_6E2,SERIAL_7N1,SERIAL_7N2,SERIAL_7O1,SERIAL_7O2,SERIAL_7E1,SERIAL_7E2,SERIAL_8N1,SERIAL_8N2,SERIAL_8O1,SERIAL_8O2,SERIAL_8E1,SERIAL_8E2 };

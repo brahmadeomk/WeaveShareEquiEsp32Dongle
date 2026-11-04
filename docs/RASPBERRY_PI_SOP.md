@@ -221,7 +221,7 @@ Expected (with the simulator; the times vary):
 10/10 OK
 ```
 **Pass:** `10/10 OK`, and the values match the device (with the simulator:
-`[0, 1]`). The dongle LED flashes **blue** (send), then **green** (receive).
+`[0, 1]`). The dongle LED flickers **blue** (send) / **green** (receive).
 If it fails, go to section 11.
 
 ### 5.2 Other reads (F2–F5)

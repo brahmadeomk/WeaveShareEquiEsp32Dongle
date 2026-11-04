@@ -111,5 +111,26 @@ int main(){
     CHECK(slaveStats[3].lateReplies==5); CHECK(late); CHECK(!never);
     diagResponseTimeoutMs = 1000;
   }
+  // ===== 18) LED: pins are really driven (active LOW) =====
+  {
+    bridgeMode = MODE_BRIDGE;
+    auto lit=[&](){ return std::string(g_pinLevel[LED_RED]==LOW?"R":"")+(g_pinLevel[LED_GREEN]==LOW?"G":"")+(g_pinLevel[LED_BLUE]==LOW?"B":""); };
+    ledInit(); CHECK(lit()=="");
+    while ((millis()%2000) < 200) g_us += 50000;     // move out of the heartbeat window
+    ledFlashTx(); ledUpdate(); CHECK(lit()=="B");    // request sent -> blue
+    ledFlashRx(); ledUpdate(); CHECK(lit()=="G");    // reply -> green (most recent wins)
+    g_us += 100000; ledUpdate(); CHECK(lit()=="");   // flash over -> off
+    ledErrUntil = millis()+500; ledUpdate(); CHECK(lit()=="R");
+    g_us += 600000;
+    while ((millis()%2000) >= 100) g_us += 10000;    // into the heartbeat window
+    healthLevel = SEV_OK;    ledUpdate(); CHECK(lit()=="G");
+    healthLevel = SEV_WARN;  ledUpdate(); CHECK(lit()=="RG");
+    healthLevel = SEV_FAULT; ledUpdate(); CHECK(lit()=="R");
+    bridgeMode = MODE_SNIFF; healthLevel = SEV_OK;
+    while ((millis()%1000) >= 100) g_us += 10000;
+    ledUpdate(); CHECK(lit()=="GB");                 // sniffer -> cyan
+    bridgeMode = MODE_BRIDGE;
+    printf("  LED: blue/green/red/heartbeat/cyan patterns drive the pins correctly\n");
+  }
   printf(fails? "%d FAILED\n" : "ALL PASSED\n", fails); return fails;
 }

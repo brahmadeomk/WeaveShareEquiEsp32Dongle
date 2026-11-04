@@ -100,7 +100,7 @@ The most common failures:
 
 | Failed test | Usual reason | Fix |
 |---|---|---|
-| 1 Find the dongle | Charge-only USB cable, or the dongle isn't flashed | Use a data cable. The dongle LED should flash **white** when plugged in. `python quick_test.py --list` shows the ports |
+| 1 Find the dongle | Charge-only USB cable, or the dongle isn't flashed | Use a data cable. At power-up the dongle LED shows **red → green → blue**. `python quick_test.py --list` shows the ports |
 | 1 (more than one adapter) | Other USB serial devices are plugged in | Unplug them, or name the ports: `python quick_test.py --dongle COM5 --adapter COM6` |
 | 3 Read a register | Wiring | A to A, B to B, GND to GND. Still failing? Swap A and B at one end |
 | Any test: "Serial port error" | Another program has the port open | Close Serial Monitor, Modbus Poll, PuTTY, then run again |
@@ -118,7 +118,7 @@ Tick each box.
 
 | ✔ | Check | How | OK when |
 |---|---|---|---|
-| ☐ | **1. LED** | Unplug the dongle and plug it in again. Then run the quick test again | One **white** flash at power-up. **Blue/green** flashes while the test runs |
+| ☐ | **1. LED** | Unplug the dongle and plug it in again. Watch the LED. Then run the quick test | At power-up: **red → green → blue** once. Then a short **green** blink every 2 s. While the test runs: fast **blue/green** flicker. Right after the full test: **red** blink every 2 s. That's expected, because the test causes errors on purpose. It turns green after **Reset statistics** on the web page |
 | ☐ | **2. Relays stay off** | Only if relay outputs are connected: watch them while plugging in | **No relay clicks** |
 | ☐ | **3. WiFi page** | Connect a phone or laptop to WiFi **ModbusDongle** (password **12345678**). Open **http://192.168.4.1** and log in with **admin / admin**. Press **Reset statistics**. On the test PC run `python quick_test.py --traffic` | The **Diagnostics** page opens. After `--traffic`, the top bar turns **green: "Bus healthy"** with slave 1 at 100 % |
 | ☐ | **4. Change the password** | On the WiFi page: **Settings → Security**, set a new password twice, **Save Security** | "Security settings saved". The red "default login" banner is gone |

@@ -272,7 +272,7 @@ def main():
             st["dongle"] = auto_d
         if not st["dongle"]:
             return False, "No dongle (Arduino Nano ESP32) found.", \
-                "Plug the dongle in with a DATA USB cable (the LED flashes white at power-up). " \
+                "Plug the dongle in with a DATA USB cable (at power-up the LED shows red, green, blue). " \
                 "Run 'python quick_test.py --list' to see the ports. Windows: look in Device Manager > Ports (COM & LPT)."
         if use_adapter and not st["adapter"]:
             if len(others) > 1:

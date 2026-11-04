@@ -1,7 +1,7 @@
 #include "Arduino.h"
 unsigned long g_us = 1000000;
 unsigned long millis(){return g_us/1000;} unsigned long micros(){return g_us;} void delay(unsigned long ms){g_us+=ms*1000;} void delayMicroseconds(unsigned u){g_us+=u;}
-void pinMode(uint8_t,uint8_t){} void digitalWrite(uint8_t,uint8_t){}
+uint8_t g_pinLevel[64]; void pinMode(uint8_t,uint8_t){} void digitalWrite(uint8_t p,uint8_t v){ if(p<64) g_pinLevel[p]=v; }
 esp_event_base_t ARDUINO_USB_CDC_EVENTS="cdc";
 int Stream::available(){return 0;} int Stream::read(){return -1;} size_t Stream::read(uint8_t*,size_t){return 0;} size_t Stream::write(const uint8_t*,size_t n){return n;} void Stream::flush(){}
 void Stream::println(const char*s){printf("%s\n",s);} void Stream::printf(const char*f,...){va_list a;va_start(a,f);vprintf(f,a);va_end(a);}
